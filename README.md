@@ -33,6 +33,7 @@ curl http://127.0.0.1:8080/health
 `list` 的表格和 JSON 都以 UTC 时分秒展示注册时间和 Controller 收到的最近一次心跳时间，例如 `13:31:08`。第一次心跳到达前，表格显示 `-`，JSON 的 `last_heartbeat_at` 为 `null`。
 
 Controller 暂时无法连接，或注册、心跳 RPC 超时时，Agent 会等待 3 秒再重试。
+如果 Controller 已完成注册，重试同一次注册会取回原会话。
 
 ## 地址配置
 

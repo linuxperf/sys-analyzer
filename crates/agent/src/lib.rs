@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, error::Error, io, iter, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use chrono::Utc;
@@ -10,7 +10,7 @@ use sys_analyzer_shared::{
     parse_controller_url,
 };
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
-use tonic::{Code, transport::Endpoint};
+use tonic::{Code, Status, transport::Endpoint};
 use uuid::Uuid;
 
 const CONTROLLER_RETRY_DELAY: Duration = Duration::from_secs(3);
@@ -30,6 +30,7 @@ pub fn registration_request(
         version: env!("CARGO_PKG_VERSION").to_owned(),
         labels,
         metadata,
+        registration_attempt_id: Uuid::new_v4().to_string(),
     }
 }
 
@@ -50,7 +51,10 @@ fn controller_endpoint(controller: &str) -> Result<Endpoint> {
         .timeout(Duration::from_secs(5)))
 }
 
-pub async fn run(controller: &str, request: RegisterRequest) -> Result<()> {
+pub async fn run(controller: &str, mut request: RegisterRequest) -> Result<()> {
+    if request.registration_attempt_id.is_empty() {
+        request.registration_attempt_id = Uuid::new_v4().to_string();
+    }
     let agent_id = request.agent_id.clone();
     let endpoint =
         controller_endpoint(controller).with_context(|| format!("register Agent {agent_id:?}"))?;
@@ -58,7 +62,7 @@ pub async fn run(controller: &str, request: RegisterRequest) -> Result<()> {
     let session = loop {
         match client.register(request.clone()).await {
             Ok(response) => break response.into_inner(),
-            Err(error) if is_retryable_rpc_error(error.code()) => {
+            Err(error) if is_retryable_rpc_error(&error) => {
                 eprintln!(
                     "Registration for Agent {agent_id:?} at {controller} failed and will retry ({error})"
                 );
@@ -91,7 +95,7 @@ pub async fn run(controller: &str, request: RegisterRequest) -> Result<()> {
             .await;
         let response = match response {
             Ok(response) => response.into_inner(),
-            Err(error) if is_retryable_rpc_error(error.code()) => {
+            Err(error) if is_retryable_rpc_error(&error) => {
                 eprintln!("Heartbeat for Agent {agent_id:?} failed and will retry ({error})");
                 ticks.reset_after(CONTROLLER_RETRY_DELAY);
                 continue;
@@ -109,10 +113,22 @@ pub async fn run(controller: &str, request: RegisterRequest) -> Result<()> {
     }
 }
 
-fn is_retryable_rpc_error(code: Code) -> bool {
+fn is_retryable_rpc_error(status: &Status) -> bool {
     // Tonic reports a local RPC timeout as Cancelled.
     matches!(
-        code,
+        status.code(),
         Code::Cancelled | Code::DeadlineExceeded | Code::Unavailable
-    )
+    ) || iter::successors(status.source(), |&source| source.source()).any(|source| {
+        // Tonic can report local socket failures as Unknown or Internal.
+        source.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }

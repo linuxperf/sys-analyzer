@@ -83,6 +83,7 @@ impl Registry {
 struct RegisteredAgent {
     record: AgentRecord,
     session_id: Uuid,
+    registration_attempt_id: String,
     lease_expires_at: DateTime<Utc>,
 }
 
@@ -163,29 +164,39 @@ impl AgentRegistration for Registry {
         }
 
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
-        let Entry::Vacant(entry) = agents.entry(request.agent_id.clone()) else {
-            return Err(Status::already_exists(format!(
-                "Agent {:?} is already online",
-                request.agent_id
-            )));
+        let registered = match agents.entry(request.agent_id.clone()) {
+            Entry::Occupied(entry)
+                if !request.registration_attempt_id.is_empty()
+                    && request.registration_attempt_id == entry.get().registration_attempt_id =>
+            {
+                entry.into_mut()
+            }
+            Entry::Occupied(_) => {
+                return Err(Status::already_exists(format!(
+                    "Agent {:?} is already online",
+                    request.agent_id
+                )));
+            }
+            Entry::Vacant(entry) => {
+                let registered_at = Utc::now();
+                entry.insert(RegisteredAgent {
+                    record: AgentRecord {
+                        agent_id: request.agent_id,
+                        hostname: request.hostname,
+                        pid: request.pid,
+                        version: request.version,
+                        labels: request.labels,
+                        metadata: request.metadata,
+                        status: AgentStatus::Online,
+                        registered_at,
+                        last_heartbeat_at: None,
+                    },
+                    session_id: Uuid::new_v4(),
+                    registration_attempt_id: request.registration_attempt_id,
+                    lease_expires_at: self.heartbeat.lease_expires_at(registered_at)?,
+                })
+            }
         };
-
-        let registered_at = Utc::now();
-        let registered = entry.insert(RegisteredAgent {
-            record: AgentRecord {
-                agent_id: request.agent_id,
-                hostname: request.hostname,
-                pid: request.pid,
-                version: request.version,
-                labels: request.labels,
-                metadata: request.metadata,
-                status: AgentStatus::Online,
-                registered_at,
-                last_heartbeat_at: None,
-            },
-            session_id: Uuid::new_v4(),
-            lease_expires_at: self.heartbeat.lease_expires_at(registered_at)?,
-        });
 
         Ok(Response::new(RegisterResponse {
             session_id: registered.session_id.to_string(),

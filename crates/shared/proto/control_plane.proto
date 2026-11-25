@@ -14,6 +14,8 @@ message RegisterRequest {
   string version = 4;
   repeated string labels = 5;
   map<string, string> metadata = 6;
+  // Reuse this ID when retrying the same registration. Empty disables replay.
+  string registration_attempt_id = 7;
 }
 
 message RegisterResponse {

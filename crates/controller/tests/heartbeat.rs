@@ -6,10 +6,13 @@ use sys_analyzer_shared::grpc::{
     HeartbeatDirective, HeartbeatRequest, RegisterRequest,
     agent_registration_client::AgentRegistrationClient,
 };
-use tonic::transport::Endpoint;
+use tonic::{
+    Code,
+    transport::{Channel, Endpoint},
+};
+use uuid::Uuid;
 
-#[tokio::test]
-async fn registered_agent_heartbeats_renew_the_configured_lease() {
+async fn start_controller() -> AgentRegistrationClient<Channel> {
     let loopback = "127.0.0.1:0".parse().unwrap();
     let controller = Controller::bind_with_heartbeat(loopback, loopback, 25, 1_000)
         .await
@@ -18,8 +21,13 @@ async fn registered_agent_heartbeats_renew_the_configured_lease() {
         .unwrap()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(5));
-    let server = tokio::spawn(controller.serve());
-    let mut client = AgentRegistrationClient::connect(endpoint).await.unwrap();
+    tokio::spawn(controller.serve());
+    AgentRegistrationClient::connect(endpoint).await.unwrap()
+}
+
+#[tokio::test]
+async fn registered_agent_heartbeats_renew_the_configured_lease() {
+    let mut client = start_controller().await;
     let registration = client
         .register(RegisterRequest {
             agent_id: "test-agent".to_owned(),
@@ -50,6 +58,26 @@ async fn registered_agent_heartbeats_renew_the_configured_lease() {
         assert!(response.lease_expires_at_unix_ms > previous_expiry);
         previous_expiry = response.lease_expires_at_unix_ms;
     }
+}
 
-    server.abort();
+#[tokio::test]
+async fn replaying_registration_returns_the_original_session() {
+    let mut client = start_controller().await;
+    let request = RegisterRequest {
+        agent_id: "test-agent".to_owned(),
+        registration_attempt_id: Uuid::new_v4().to_string(),
+        ..Default::default()
+    };
+    let original = client.register(request.clone()).await.unwrap().into_inner();
+    let replay = client.register(request.clone()).await.unwrap().into_inner();
+    assert_eq!(replay, original);
+
+    let conflict = client
+        .register(RegisterRequest {
+            registration_attempt_id: Uuid::new_v4().to_string(),
+            ..request
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code(), Code::AlreadyExists);
 }

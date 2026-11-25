@@ -4,10 +4,14 @@ import http.client
 import json
 import os
 import re
+import select
 import signal
 import socket
+import socketserver
+import struct
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, time as clock_time, timedelta, timezone
@@ -146,6 +150,37 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(row["pid"], agent.pid)
         self.assertEqual(row["status"], "Online")
 
+    def test_agent_retries_after_tcp_reset_during_registration_or_heartbeat(self):
+        for stream_id, call in ((1, "Registration"), (3, "Heartbeat")):
+            with self.subTest(call=call):
+                rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
+                proxy_addr, _ = self.start_grpc_reply_proxy(grpc_addr, stream_id, reset=True)
+                agent, log = self.start_agent(proxy_addr, "--agent-id", "reset-agent")
+                self.wait_for_output(agent, log, rf'^{call} for Agent "reset-agent" .*will retry')
+                resumed_at = datetime.now(timezone.utc)
+                self.wait_for_registration(agent, log)
+                row = self.wait_for_heartbeat(rest_addr, resumed_at)
+                self.assertEqual(row["pid"], agent.pid)
+                self.assertEqual(row["status"], "Online")
+
+    def test_agent_replays_registration_after_its_committed_reply_times_out(self):
+        rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
+        proxy_addr, release_reply = self.start_grpc_reply_proxy(grpc_addr, 1)
+        agent, log = self.start_agent(proxy_addr, "--agent-id", "replay-agent")
+        try:
+            self.wait_for_output(agent, log, r'^Registration for Agent "replay-agent" .*will retry')
+            original, = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+            self.assertEqual(original["status"], "Online")
+            self.assertIsNone(original["last_heartbeat_at"])
+        finally:
+            release_reply.set()
+
+        resumed_at = datetime.now(timezone.utc)
+        self.wait_for_registration(agent, log)
+        row = self.wait_for_heartbeat(rest_addr, resumed_at)
+        self.assertEqual(row["registered_at"], original["registered_at"])
+        self.assertEqual(row["pid"], agent.pid)
+
     def test_concurrent_agents_keep_reporting_heartbeats_to_the_cli(self):
         lease_timeout_ms = 1000
         rest_addr, grpc_addr = self.start_controller(
@@ -211,17 +246,74 @@ class ControlPlaneTests(unittest.TestCase):
         finally:
             controller.send_signal(signal.SIGCONT)
 
-        resumed_at = datetime.now(timezone.utc)
+        row = self.wait_for_heartbeat(rest_addr, datetime.now(timezone.utc))
+        self.assertEqual(row["status"], "Online")
+        self.assertEqual(row["registered_at"], initial["registered_at"])
+
+    def wait_for_heartbeat(self, rest_addr, after):
         deadline = time.monotonic() + TIMEOUT
         while time.monotonic() < deadline:
             row, = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
-            self.assertEqual(row["status"], "Online")
-            self.assertEqual(row["registered_at"], initial["registered_at"])
             heartbeat = row["last_heartbeat_at"]
-            if heartbeat is not None and parse_utc_clock(heartbeat) > resumed_at:
-                return
+            if heartbeat is not None and parse_utc_clock(heartbeat) > after:
+                return row
             time.sleep(0.025)
-        self.fail("Agent did not report another heartbeat after the Controller resumed")
+        self.fail("Agent did not report a new heartbeat")
+
+    def start_grpc_reply_proxy(self, grpc_addr, stream_id, *, reset=False):
+        upstream_host, upstream_port = grpc_addr.split(":")
+        upstream_addr = (upstream_host, int(upstream_port))
+        fault_injected = threading.Event()
+        release_reply = threading.Event()
+
+        class Relay(socketserver.BaseRequestHandler):
+            def handle(self):
+                downstream = self.request
+                try:
+                    with socket.create_connection(upstream_addr, timeout=TIMEOUT) as upstream:
+                        self.relay(downstream, upstream)
+                except (ConnectionError, TimeoutError):
+                    pass
+
+            def relay(self, downstream, upstream):
+                pending = bytearray()
+                while readable := select.select([downstream, upstream], [], [], TIMEOUT)[0]:
+                    if downstream in readable:
+                        data = downstream.recv(65536)
+                        if not data:
+                            return
+                        upstream.sendall(data)
+                    if upstream not in readable:
+                        continue
+                    data = upstream.recv(65536)
+                    if not data:
+                        return
+                    pending.extend(data)
+                    # The HTTP/2 frame header gives the length and stream ID.
+                    while len(pending) >= 9:
+                        frame_end = 9 + int.from_bytes(pending[0:3], "big")
+                        if len(pending) < frame_end:
+                            break
+                        reply_stream = int.from_bytes(pending[5:9], "big") & 0x7fffffff
+                        if pending[3] == 0x01 and reply_stream == stream_id and not fault_injected.is_set():
+                            fault_injected.set()
+                            if reset:
+                                downstream.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                                downstream.close()
+                                return
+                            if not release_reply.wait(TIMEOUT):
+                                return
+                        downstream.sendall(pending[:frame_end])
+                        del pending[:frame_end]
+
+        proxy = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Relay)
+        proxy.daemon_threads = True
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.server_close)
+        self.addCleanup(proxy.shutdown)
+        self.addCleanup(release_reply.set)
+        host, port = proxy.server_address
+        return f"{host}:{port}", release_reply
 
     def table_heartbeats(self, rest_addr):
         header, *table_rows = self.cli(rest_addr, "list").stdout.splitlines()
