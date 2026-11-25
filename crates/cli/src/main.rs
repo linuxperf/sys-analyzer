@@ -88,6 +88,7 @@ fn write_table(writer: &mut impl Write, agents: &[AgentRecord]) -> Result<()> {
             "Version",
             "Status",
             "Registered at (UTC)",
+            "Last heartbeat (UTC)",
             "Labels",
             "Metadata",
         ]
@@ -101,6 +102,9 @@ fn write_table(writer: &mut impl Write, agents: &[AgentRecord]) -> Result<()> {
             escape_control(&agent.version),
             format!("{:?}", agent.status),
             agent.registered_at.to_rfc3339(),
+            agent
+                .last_heartbeat_at
+                .map_or_else(|| "-".to_owned(), |time| time.to_rfc3339()),
             escape_control(&serde_json::to_string(&agent.labels)?),
             escape_control(&serde_json::to_string(&agent.metadata)?),
         ]);

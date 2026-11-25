@@ -39,6 +39,7 @@ pub struct AgentRecord {
     pub metadata: BTreeMap<String, String>,
     pub status: AgentStatus,
     pub registered_at: DateTime<Utc>,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
 }
 
 pub mod grpc {

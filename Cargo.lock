@@ -964,6 +964,7 @@ name = "sys-analyzer-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "rustix",
  "sys-analyzer-shared",

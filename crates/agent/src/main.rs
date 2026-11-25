@@ -1,8 +1,6 @@
-use std::future::pending;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use sys_analyzer_agent::{register, registration_request};
+use sys_analyzer_agent::{registration_request, run};
 use sys_analyzer_shared::DEFAULT_GRPC_ADDR;
 
 #[derive(Parser)]
@@ -26,16 +24,7 @@ async fn main() -> Result<()> {
         args.labels,
         args.metadata.into_iter().collect(),
     );
-    let agent_id = request.agent_id.clone();
-    let session = register(&args.controller, request)
-        .await
-        .with_context(|| format!("register Agent {agent_id:?}"))?;
-    println!(
-        "Agent {agent_id:?} registered with session {}",
-        session.session_id
-    );
-    pending::<()>().await;
-    Ok(())
+    run(&args.controller, request).await
 }
 
 fn parse_metadata(entry: &str) -> Result<(String, String), String> {

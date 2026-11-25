@@ -1,6 +1,6 @@
 # sys-analyzer
 
-sys-analyzer 的控制面由一个 Controller、多个 Agent 和一个查询 CLI 组成。Agent 通过明文 gRPC（h2c）主动注册，CLI 通过明文 HTTP/1.1 查询 Controller。
+sys-analyzer 的控制面由一个 Controller、多个 Agent 和一个查询 CLI 组成。Agent 通过明文 gRPC（h2c）主动注册，并按 Controller 下发的间隔发送心跳续租。CLI 通过明文 HTTP/1.1 查询 Controller。
 
 ## 本地运行
 
@@ -30,6 +30,9 @@ curl http://127.0.0.1:8080/health
 
 `GET /health` 返回 `{"status":"ok"}`。`GET /agents` 返回 Agent 列表。注册记录保存在 Controller 内存中，重启 Controller 会清空列表。
 
+`list` 展示 Controller 收到的最近一次心跳的 UTC 时间。第一次心跳到达前，表格显示 `-`，JSON 的 `last_heartbeat_at` 为 `null`。
+心跳 RPC 超时或连接暂时不可用时，Agent 会在后续周期重试。
+
 ## 地址配置
 
 | 组件 | 参数 | 环境变量 | 默认值 |
@@ -38,6 +41,8 @@ curl http://127.0.0.1:8080/health
 | Controller gRPC | `--grpc-addr` | `SYS_ANALYZER_GRPC_ADDR` | `127.0.0.1:50051` |
 | Agent | `--controller` | `SYS_ANALYZER_GRPC_URL` | `http://127.0.0.1:50051` |
 | CLI | `--controller` | `SYS_ANALYZER_REST_URL` | `http://127.0.0.1:8080` |
+
+Controller 使用 `--heartbeat-interval-ms`（`SYS_ANALYZER_HEARTBEAT_INTERVAL_MS`）配置心跳间隔，默认为 5000 毫秒。使用 `--lease-timeout-ms`（`SYS_ANALYZER_LEASE_TIMEOUT_MS`）配置租约时长，默认为 15000 毫秒。心跳间隔须大于零，租约时长须大于心跳间隔。
 
 ## 测试
 
@@ -48,4 +53,4 @@ cargo test --locked --workspace
 ./e2e/control_plane.py -v
 ```
 
-端到端测试使用 Python 3.11 或更新版本的标准库。脚本会构建并启动 Controller、Agent 和 CLI，使用临时回环端口验证健康检查、Agent 注册和冲突处理、CLI 查询及连接失败。
+端到端测试使用 Python 3.11 或更新版本的标准库。脚本会构建并启动 Controller、Agent 和 CLI，使用临时回环端口验证健康检查、Agent 注册和冲突处理、多 Agent 心跳保活、CLI 查询及连接失败。
