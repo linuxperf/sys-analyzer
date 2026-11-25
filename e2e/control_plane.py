@@ -17,6 +17,7 @@ from uuid import UUID
 
 ROOT = Path(__file__).resolve().parents[1]
 TIMEOUT = 10
+UTC_SECONDS = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -63,7 +64,8 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(row["labels"], ["test"])
         self.assertEqual(row["metadata"], {"zone": "local"})
         self.assertEqual(row["status"], "Online")
-        self.assertGreater(datetime.fromisoformat(row["registered_at"].replace("Z", "+00:00")).timestamp(), 0)
+        self.assertRegex(row["registered_at"], UTC_SECONDS)
+        self.assertGreater(datetime.fromisoformat(row["registered_at"]).timestamp(), 0)
 
         _, table_row = self.cli(rest_addr, "list").stdout.splitlines()
         # Five wide characters occupy ten columns, followed by the column gap.
@@ -105,7 +107,7 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertTrue(table_row.startswith(row["agent_id"]), table_row)
             self.assertIn(row["hostname"], table_row)
             self.assertIn("Online", table_row)
-            self.assertIn(row["registered_at"].replace("Z", "+00:00"), table_row)
+            self.assertIn(row["registered_at"], table_row)
             self.assertIn(json.dumps(row["labels"]), table_row)
 
     def test_unreachable_controller_exits_with_an_error(self):
@@ -145,6 +147,7 @@ class ControlPlaneTests(unittest.TestCase):
                 agent_id = row["agent_id"]
                 self.assertEqual(row["status"], "Online")
                 if row["last_heartbeat_at"] is not None:
+                    self.assertRegex(row["last_heartbeat_at"], UTC_SECONDS)
                     heartbeat = datetime.fromisoformat(row["last_heartbeat_at"])
                     self.assertGreaterEqual(heartbeat, last_seen[agent_id])
                     if heartbeat > last_seen[agent_id]:
@@ -202,6 +205,7 @@ class ControlPlaneTests(unittest.TestCase):
         heartbeats = {}
         for table_row in table_rows:
             values = re.split(r" {2,}", table_row)
+            self.assertRegex(values[heartbeat_column], UTC_SECONDS)
             heartbeats[values[0]] = datetime.fromisoformat(values[heartbeat_column])
         return heartbeats
 

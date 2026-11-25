@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use chrono::{SecondsFormat, SubsecRound};
 use clap::{Parser, Subcommand, ValueEnum};
 use http::Uri;
 use http_body_util::{BodyExt, Empty};
@@ -47,6 +48,11 @@ async fn main() -> Result<()> {
     match output {
         Output::Table => write_table(&mut writer, &agents)?,
         Output::Json => {
+            let mut agents = agents;
+            for agent in &mut agents {
+                agent.registered_at = agent.registered_at.trunc_subsecs(0);
+                agent.last_heartbeat_at = agent.last_heartbeat_at.map(|time| time.trunc_subsecs(0));
+            }
             serde_json::to_writer_pretty(&mut writer, &agents)?;
             writeln!(writer)?;
         }
@@ -101,10 +107,13 @@ fn write_table(writer: &mut impl Write, agents: &[AgentRecord]) -> Result<()> {
             agent.pid.to_string(),
             escape_control(&agent.version),
             format!("{:?}", agent.status),
-            agent.registered_at.to_rfc3339(),
             agent
-                .last_heartbeat_at
-                .map_or_else(|| "-".to_owned(), |time| time.to_rfc3339()),
+                .registered_at
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            agent.last_heartbeat_at.map_or_else(
+                || "-".to_owned(),
+                |time| time.to_rfc3339_opts(SecondsFormat::Secs, true),
+            ),
             escape_control(&serde_json::to_string(&agent.labels)?),
             escape_control(&serde_json::to_string(&agent.metadata)?),
         ]);
