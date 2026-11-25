@@ -129,6 +129,23 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertIn(f"query Controller at http://{rest_addr}", output.stderr)
         self.assertIn("HTTP request failed", output.stderr)
 
+    def test_agent_retries_when_started_before_the_controller(self):
+        with socket.socket() as reserved_port:
+            reserved_port.bind(("127.0.0.1", 0))
+            host, port = reserved_port.getsockname()
+            grpc_addr = f"{host}:{port}"
+            agent, log = self.start_agent(grpc_addr, "--agent-id", "early-agent")
+            self.wait_for_output(agent, log, r'^Registration for Agent "early-agent" .* will retry')
+            retry_started_at = time.monotonic()
+
+        _, (rest_addr, _) = self.spawn_controller(grpc_addr=grpc_addr)
+        agent_id, _ = self.wait_for_registration(agent, log)
+        self.assertGreaterEqual(time.monotonic() - retry_started_at, 2.5)
+        row, = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+        self.assertEqual(row["agent_id"], agent_id)
+        self.assertEqual(row["pid"], agent.pid)
+        self.assertEqual(row["status"], "Online")
+
     def test_concurrent_agents_keep_reporting_heartbeats_to_the_cli(self):
         lease_timeout_ms = 1000
         rest_addr, grpc_addr = self.start_controller(
@@ -221,9 +238,9 @@ class ControlPlaneTests(unittest.TestCase):
         _, addresses = self.spawn_controller(*args)
         return addresses
 
-    def spawn_controller(self, *args):
+    def spawn_controller(self, *args, grpc_addr="127.0.0.1:0"):
         process, log = self.spawn(
-            "sys-analyzer-controller", "--rest-addr", "127.0.0.1:0", "--grpc-addr", "127.0.0.1:0",
+            "sys-analyzer-controller", "--rest-addr", "127.0.0.1:0", "--grpc-addr", grpc_addr,
             *args,
         )
         addresses = self.wait_for_output(
