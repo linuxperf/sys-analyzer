@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{self, Write},
     time::Duration,
 };
@@ -9,7 +10,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use http::Uri;
 use http_body_util::{BodyExt, Empty};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use sys_analyzer_shared::{AGENTS_PATH, AgentRecord, DEFAULT_REST_ADDR, parse_controller_url};
+use serde::Serialize;
+use sys_analyzer_shared::{
+    AGENTS_PATH, AgentRecord, AgentStatus, DEFAULT_REST_ADDR, parse_controller_url,
+};
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Parser)]
@@ -36,6 +40,19 @@ enum Output {
     Json,
 }
 
+#[derive(Serialize)]
+struct JsonAgentRecord<'a> {
+    agent_id: &'a str,
+    hostname: &'a str,
+    pid: u32,
+    version: &'a str,
+    labels: &'a [String],
+    metadata: &'a BTreeMap<String, String>,
+    status: AgentStatus,
+    registered_at: i64,
+    last_heartbeat_at: Option<i64>,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -47,10 +64,7 @@ async fn main() -> Result<()> {
     let mut writer = io::stdout().lock();
     match output {
         Output::Table => write_table(&mut writer, &agents)?,
-        Output::Json => {
-            serde_json::to_writer_pretty(&mut writer, &agents)?;
-            writeln!(writer)?;
-        }
+        Output::Json => write_json(&mut writer, &agents)?,
     }
     writer.flush()?;
     Ok(())
@@ -78,6 +92,26 @@ async fn list_agents(controller: &str) -> Result<Vec<AgentRecord>> {
     .context("Controller request timed out")??
     .to_bytes();
     serde_json::from_slice(&body).context("invalid Agent list from Controller")
+}
+
+fn write_json(writer: &mut impl Write, agents: &[AgentRecord]) -> Result<()> {
+    let rows: Vec<_> = agents
+        .iter()
+        .map(|agent| JsonAgentRecord {
+            agent_id: &agent.agent_id,
+            hostname: &agent.hostname,
+            pid: agent.pid,
+            version: &agent.version,
+            labels: &agent.labels,
+            metadata: &agent.metadata,
+            status: agent.status,
+            registered_at: agent.registered_at.timestamp(),
+            last_heartbeat_at: agent.last_heartbeat_at.map(|time| time.timestamp()),
+        })
+        .collect();
+    serde_json::to_writer_pretty(&mut *writer, &rows)?;
+    writeln!(writer)?;
+    Ok(())
 }
 
 fn write_table(writer: &mut impl Write, agents: &[AgentRecord]) -> Result<()> {
@@ -148,7 +182,6 @@ fn escape_control(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sys_analyzer_shared::AgentStatus;
 
     #[test]
     fn table_displays_unix_seconds_across_utc_midnight() {

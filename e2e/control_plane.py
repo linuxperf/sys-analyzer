@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -68,14 +68,16 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(row["labels"], ["test"])
         self.assertEqual(row["metadata"], {"zone": "local"})
         self.assertEqual(row["status"], "Online")
-        self.assertRegex(row["registered_at"], UTC_TIMESTAMP)
+        self.assertIs(type(row["registered_at"]), int)
         connection = http.client.HTTPConnection(rest_addr, timeout=TIMEOUT)
         self.addCleanup(connection.close)
         connection.request("GET", "/agents")
         response = connection.getresponse()
         self.assertEqual(response.status, 200)
         registered, = json.load(response)
-        self.assertEqual(row["registered_at"], registered["registered_at"])
+        self.assertRegex(registered["registered_at"], UTC_TIMESTAMP)
+        self.assertEqual(row["registered_at"],
+                         int(datetime.fromisoformat(registered["registered_at"]).timestamp()))
 
         _, table_row = self.cli(rest_addr, "list").stdout.splitlines()
         # Five wide characters occupy ten columns, followed by the column gap.
@@ -119,9 +121,8 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertIn(row["hostname"], table_row)
             self.assertIn("Online", table_row)
             values = re.split(r" {2,}", table_row)
-            registered_at = datetime.fromisoformat(row["registered_at"])
             self.assertEqual(values[columns.index("Registered at (UTC)")],
-                             str(int(registered_at.timestamp())))
+                             str(row["registered_at"]))
             self.assertIn(json.dumps(row["labels"]), table_row)
 
     def test_unreachable_controller_exits_with_an_error(self):
@@ -159,7 +160,7 @@ class ControlPlaneTests(unittest.TestCase):
                 proxy_addr, _ = self.start_grpc_reply_proxy(grpc_addr, stream_id, reset=True)
                 agent, log = self.start_agent(proxy_addr, "--agent-id", "reset-agent")
                 self.wait_for_output(agent, log, rf'^{call} for Agent "reset-agent" .*will retry')
-                resumed_at = datetime.now(timezone.utc)
+                resumed_at = int(time.time())
                 self.wait_for_registration(agent, log)
                 row = self.wait_for_heartbeat(rest_addr, resumed_at)
                 self.assertEqual(row["pid"], agent.pid)
@@ -177,16 +178,16 @@ class ControlPlaneTests(unittest.TestCase):
         finally:
             release_reply.set()
 
-        resumed_at = datetime.now(timezone.utc)
+        resumed_at = int(time.time())
         self.wait_for_registration(agent, log)
         row = self.wait_for_heartbeat(rest_addr, resumed_at)
         self.assertEqual(row["registered_at"], original["registered_at"])
         self.assertEqual(row["pid"], agent.pid)
 
     def test_concurrent_agents_keep_reporting_heartbeats_to_the_cli(self):
-        lease_timeout_ms = 1000
+        lease_timeout_seconds = 1
         rest_addr, grpc_addr = self.start_controller(
-            "--heartbeat-interval-ms", "100", "--lease-timeout-ms", str(lease_timeout_ms),
+            "--heartbeat-interval-ms", "100", "--lease-timeout-ms", str(lease_timeout_seconds * 1000),
         )
         processes = [self.start_agent(grpc_addr, "--agent-id", agent_id)
                      for agent_id in ("first", "second")]
@@ -195,10 +196,9 @@ class ControlPlaneTests(unittest.TestCase):
         initial_rows = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
         registrations = {row["agent_id"]: row["registered_at"] for row in initial_rows}
         self.assertEqual(registrations.keys(), agent_ids)
-        last_seen = {agent_id: datetime.fromisoformat(timestamp)
-                     for agent_id, timestamp in registrations.items()}
-        initial_expiries = {agent_id: registered_at + timedelta(milliseconds=lease_timeout_ms)
-                            for agent_id, registered_at in last_seen.items()}
+        last_seen = registrations.copy()
+        initial_expiries = {agent_id: registered_at + lease_timeout_seconds
+                            for agent_id, registered_at in registrations.items()}
         rounds = dict.fromkeys(agent_ids, 0)
         first_table = None
         deadline = time.monotonic() + TIMEOUT
@@ -208,9 +208,9 @@ class ControlPlaneTests(unittest.TestCase):
             for row in rows:
                 agent_id = row["agent_id"]
                 self.assertEqual(row["status"], "Online")
-                if row["last_heartbeat_at"] is not None:
-                    self.assertRegex(row["last_heartbeat_at"], UTC_TIMESTAMP)
-                    heartbeat = datetime.fromisoformat(row["last_heartbeat_at"])
+                heartbeat = row["last_heartbeat_at"]
+                if heartbeat is not None:
+                    self.assertIs(type(heartbeat), int)
                     self.assertGreaterEqual(heartbeat, last_seen[agent_id])
                     if heartbeat > last_seen[agent_id]:
                         last_seen[agent_id] = heartbeat
@@ -221,7 +221,7 @@ class ControlPlaneTests(unittest.TestCase):
             if first_table is not None and all(
                 rounds[agent_id] >= 3
                 and last_seen[agent_id] > initial_expiries[agent_id]
-                and int(last_seen[agent_id].timestamp()) > first_table[agent_id]
+                and last_seen[agent_id] > first_table[agent_id]
                 for agent_id in agent_ids
             ):
                 break
@@ -233,7 +233,7 @@ class ControlPlaneTests(unittest.TestCase):
         for agent_id in agent_ids:
             self.assertGreater(last_seen[agent_id], initial_expiries[agent_id], agent_id)
             self.assertGreater(final_table[agent_id], first_table[agent_id], agent_id)
-            self.assertGreaterEqual(final_table[agent_id], int(last_seen[agent_id].timestamp()), agent_id)
+            self.assertGreaterEqual(final_table[agent_id], last_seen[agent_id], agent_id)
 
     def test_agent_resumes_heartbeats_after_a_timed_out_call(self):
         controller, (rest_addr, grpc_addr) = self.spawn_controller(
@@ -249,7 +249,7 @@ class ControlPlaneTests(unittest.TestCase):
         finally:
             controller.send_signal(signal.SIGCONT)
 
-        row = self.wait_for_heartbeat(rest_addr, datetime.now(timezone.utc))
+        row = self.wait_for_heartbeat(rest_addr, int(time.time()))
         self.assertEqual(row["status"], "Online")
         self.assertEqual(row["registered_at"], initial["registered_at"])
 
@@ -259,11 +259,11 @@ class ControlPlaneTests(unittest.TestCase):
             grpc_addr, "--agent-id", "restart-agent", "--label", "restart", "--metadata", "zone=local",
         )
         agent_id, original_session = self.wait_for_registration(agent, log)
-        original = self.wait_for_heartbeat(rest_addr, datetime.now(timezone.utc))
+        original = self.wait_for_heartbeat(rest_addr, int(time.time()))
 
         self.stop_process(controller)
         self.wait_for_output(agent, log, r'^Heartbeat for Agent "restart-agent" failed and will retry')
-        restarted_at = datetime.now(timezone.utc)
+        restarted_at = int(time.time())
         _, (rest_addr, _) = self.spawn_controller("--heartbeat-interval-ms", "50", grpc_addr=grpc_addr)
 
         self.wait_for_output(
@@ -277,15 +277,14 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(row["status"], "Online")
         self.assertEqual(row["labels"], original["labels"])
         self.assertEqual(row["metadata"], original["metadata"])
-        self.assertGreater(datetime.fromisoformat(row["registered_at"]),
-                           datetime.fromisoformat(original["registered_at"]))
+        self.assertGreater(row["registered_at"], original["registered_at"])
 
     def wait_for_heartbeat(self, rest_addr, after):
         deadline = time.monotonic() + TIMEOUT
         while time.monotonic() < deadline:
             row, = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
             heartbeat = row["last_heartbeat_at"]
-            if heartbeat is not None and datetime.fromisoformat(heartbeat) > after:
+            if heartbeat is not None and heartbeat > after:
                 return row
             time.sleep(0.025)
         self.fail("Agent did not report a new heartbeat")

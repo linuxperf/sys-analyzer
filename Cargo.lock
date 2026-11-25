@@ -984,6 +984,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper-util",
+ "serde",
  "serde_json",
  "sys-analyzer-shared",
  "tokio",
