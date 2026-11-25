@@ -29,8 +29,9 @@ curl http://127.0.0.1:8080/health
 ```
 
 `GET /health` 返回 `{"status":"ok"}`。`GET /agents` 返回 Agent 列表。注册记录保存在 Controller 内存中，重启 Controller 会清空列表。
+存活的 Agent 收到重新注册指令后，会沿用原 Agent ID 重新上线，并按新会话的间隔继续发送心跳。
 
-`list` 的表格和 JSON 都以 UTC 时分秒展示注册时间和 Controller 收到的最近一次心跳时间，例如 `13:31:08`。第一次心跳到达前，表格显示 `-`，JSON 的 `last_heartbeat_at` 为 `null`。
+`list` 的表格以 Unix 时间戳（自 `1970-01-01T00:00:00Z` 起的总秒数）展示注册时间和 Controller 收到的最近一次心跳时间。JSON 使用 RFC 3339 UTC 时间戳并保留小数秒，例如 `2024-01-01T00:00:00.123Z`。第一次心跳到达前，表格显示 `-`，JSON 的 `last_heartbeat_at` 为 `null`。
 
 Controller 暂时无法连接，或注册、心跳 RPC 超时时，Agent 会等待 3 秒再重试。
 如果 Controller 已完成注册，重试同一次注册会取回原会话。

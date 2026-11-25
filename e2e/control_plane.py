@@ -14,21 +14,14 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, time as clock_time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
 
 ROOT = Path(__file__).resolve().parents[1]
 TIMEOUT = 10
-UTC_SECONDS = r"^\d{2}:\d{2}:\d{2}$"
-
-
-def parse_utc_clock(value):
-    now = datetime.now(timezone.utc)
-    timestamp = datetime.combine(now.date(), clock_time.fromisoformat(value), timezone.utc)
-    # Test observations are recent and may cross midnight UTC.
-    return timestamp - timedelta(days=1) if timestamp > now else timestamp
+UTC_TIMESTAMP = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$"
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -75,7 +68,14 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(row["labels"], ["test"])
         self.assertEqual(row["metadata"], {"zone": "local"})
         self.assertEqual(row["status"], "Online")
-        self.assertRegex(row["registered_at"], UTC_SECONDS)
+        self.assertRegex(row["registered_at"], UTC_TIMESTAMP)
+        connection = http.client.HTTPConnection(rest_addr, timeout=TIMEOUT)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/agents")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        registered, = json.load(response)
+        self.assertEqual(row["registered_at"], registered["registered_at"])
 
         _, table_row = self.cli(rest_addr, "list").stdout.splitlines()
         # Five wide characters occupy ten columns, followed by the column gap.
@@ -119,7 +119,9 @@ class ControlPlaneTests(unittest.TestCase):
             self.assertIn(row["hostname"], table_row)
             self.assertIn("Online", table_row)
             values = re.split(r" {2,}", table_row)
-            self.assertEqual(values[columns.index("Registered at (UTC)")], row["registered_at"])
+            registered_at = datetime.fromisoformat(row["registered_at"])
+            self.assertEqual(values[columns.index("Registered at (UTC)")],
+                             str(int(registered_at.timestamp())))
             self.assertIn(json.dumps(row["labels"]), table_row)
 
     def test_unreachable_controller_exits_with_an_error(self):
@@ -193,7 +195,7 @@ class ControlPlaneTests(unittest.TestCase):
         initial_rows = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
         registrations = {row["agent_id"]: row["registered_at"] for row in initial_rows}
         self.assertEqual(registrations.keys(), agent_ids)
-        last_seen = {agent_id: parse_utc_clock(timestamp)
+        last_seen = {agent_id: datetime.fromisoformat(timestamp)
                      for agent_id, timestamp in registrations.items()}
         initial_expiries = {agent_id: registered_at + timedelta(milliseconds=lease_timeout_ms)
                             for agent_id, registered_at in last_seen.items()}
@@ -207,8 +209,8 @@ class ControlPlaneTests(unittest.TestCase):
                 agent_id = row["agent_id"]
                 self.assertEqual(row["status"], "Online")
                 if row["last_heartbeat_at"] is not None:
-                    self.assertRegex(row["last_heartbeat_at"], UTC_SECONDS)
-                    heartbeat = parse_utc_clock(row["last_heartbeat_at"])
+                    self.assertRegex(row["last_heartbeat_at"], UTC_TIMESTAMP)
+                    heartbeat = datetime.fromisoformat(row["last_heartbeat_at"])
                     self.assertGreaterEqual(heartbeat, last_seen[agent_id])
                     if heartbeat > last_seen[agent_id]:
                         last_seen[agent_id] = heartbeat
@@ -218,7 +220,8 @@ class ControlPlaneTests(unittest.TestCase):
                 self.assertEqual(first_table.keys(), agent_ids)
             if first_table is not None and all(
                 rounds[agent_id] >= 3
-                and last_seen[agent_id] > max(initial_expiries[agent_id], first_table[agent_id])
+                and last_seen[agent_id] > initial_expiries[agent_id]
+                and int(last_seen[agent_id].timestamp()) > first_table[agent_id]
                 for agent_id in agent_ids
             ):
                 break
@@ -230,7 +233,7 @@ class ControlPlaneTests(unittest.TestCase):
         for agent_id in agent_ids:
             self.assertGreater(last_seen[agent_id], initial_expiries[agent_id], agent_id)
             self.assertGreater(final_table[agent_id], first_table[agent_id], agent_id)
-            self.assertGreaterEqual(final_table[agent_id], last_seen[agent_id], agent_id)
+            self.assertGreaterEqual(final_table[agent_id], int(last_seen[agent_id].timestamp()), agent_id)
 
     def test_agent_resumes_heartbeats_after_a_timed_out_call(self):
         controller, (rest_addr, grpc_addr) = self.spawn_controller(
@@ -250,12 +253,39 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(row["status"], "Online")
         self.assertEqual(row["registered_at"], initial["registered_at"])
 
+    def test_agent_reregisters_after_the_controller_restarts(self):
+        controller, (rest_addr, grpc_addr) = self.spawn_controller("--heartbeat-interval-ms", "100")
+        agent, log = self.start_agent(
+            grpc_addr, "--agent-id", "restart-agent", "--label", "restart", "--metadata", "zone=local",
+        )
+        agent_id, original_session = self.wait_for_registration(agent, log)
+        original = self.wait_for_heartbeat(rest_addr, datetime.now(timezone.utc))
+
+        self.stop_process(controller)
+        self.wait_for_output(agent, log, r'^Heartbeat for Agent "restart-agent" failed and will retry')
+        restarted_at = datetime.now(timezone.utc)
+        _, (rest_addr, _) = self.spawn_controller("--heartbeat-interval-ms", "50", grpc_addr=grpc_addr)
+
+        self.wait_for_output(
+            agent, log,
+            rf'^Agent "restart-agent" registered with session (?!{original_session}$)[0-9a-f-]+$',
+        )
+        row = self.wait_for_heartbeat(rest_addr, restarted_at)
+        self.assertIsNone(agent.poll())
+        self.assertEqual(row["agent_id"], agent_id)
+        self.assertEqual(row["pid"], agent.pid)
+        self.assertEqual(row["status"], "Online")
+        self.assertEqual(row["labels"], original["labels"])
+        self.assertEqual(row["metadata"], original["metadata"])
+        self.assertGreater(datetime.fromisoformat(row["registered_at"]),
+                           datetime.fromisoformat(original["registered_at"]))
+
     def wait_for_heartbeat(self, rest_addr, after):
         deadline = time.monotonic() + TIMEOUT
         while time.monotonic() < deadline:
             row, = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
             heartbeat = row["last_heartbeat_at"]
-            if heartbeat is not None and parse_utc_clock(heartbeat) > after:
+            if heartbeat is not None and datetime.fromisoformat(heartbeat) > after:
                 return row
             time.sleep(0.025)
         self.fail("Agent did not report a new heartbeat")
@@ -322,8 +352,7 @@ class ControlPlaneTests(unittest.TestCase):
         heartbeats = {}
         for table_row in table_rows:
             values = re.split(r" {2,}", table_row)
-            self.assertRegex(values[heartbeat_column], UTC_SECONDS)
-            heartbeats[values[0]] = parse_utc_clock(values[heartbeat_column])
+            heartbeats[values[0]] = int(values[heartbeat_column])
         return heartbeats
 
     def start_controller(self, *args):

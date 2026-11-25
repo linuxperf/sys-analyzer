@@ -48,14 +48,7 @@ async fn main() -> Result<()> {
     match output {
         Output::Table => write_table(&mut writer, &agents)?,
         Output::Json => {
-            let mut rows = Vec::with_capacity(agents.len());
-            for agent in &agents {
-                let mut row = serde_json::to_value(agent)?;
-                row["registered_at"] = format_utc_clock(agent.registered_at).into();
-                row["last_heartbeat_at"] = agent.last_heartbeat_at.map(format_utc_clock).into();
-                rows.push(row);
-            }
-            serde_json::to_writer_pretty(&mut writer, &rows)?;
+            serde_json::to_writer_pretty(&mut writer, &agents)?;
             writeln!(writer)?;
         }
     }
@@ -109,10 +102,10 @@ fn write_table(writer: &mut impl Write, agents: &[AgentRecord]) -> Result<()> {
             agent.pid.to_string(),
             escape_control(&agent.version),
             format!("{:?}", agent.status),
-            format_utc_clock(agent.registered_at),
+            format_unix_seconds(agent.registered_at),
             agent
                 .last_heartbeat_at
-                .map_or_else(|| "-".to_owned(), format_utc_clock),
+                .map_or_else(|| "-".to_owned(), format_unix_seconds),
             escape_control(&serde_json::to_string(&agent.labels)?),
             escape_control(&serde_json::to_string(&agent.metadata)?),
         ]);
@@ -136,8 +129,8 @@ fn write_table(writer: &mut impl Write, agents: &[AgentRecord]) -> Result<()> {
     Ok(())
 }
 
-fn format_utc_clock(time: DateTime<Utc>) -> String {
-    time.format("%H:%M:%S").to_string()
+fn format_unix_seconds(time: DateTime<Utc>) -> String {
+    time.timestamp().to_string()
 }
 
 fn escape_control(value: &str) -> String {
@@ -150,4 +143,31 @@ fn escape_control(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sys_analyzer_shared::AgentStatus;
+
+    #[test]
+    fn table_displays_unix_seconds_across_utc_midnight() {
+        let agent = AgentRecord {
+            agent_id: "test-agent".to_owned(),
+            hostname: "localhost".to_owned(),
+            pid: 1,
+            version: "0.1.0".to_owned(),
+            labels: Vec::new(),
+            metadata: Default::default(),
+            status: AgentStatus::Online,
+            registered_at: "2023-12-31T23:59:59.9Z".parse().unwrap(),
+            last_heartbeat_at: Some("2024-01-01T00:00:00.1Z".parse().unwrap()),
+        };
+        let mut output = Vec::new();
+        write_table(&mut output, &[agent]).unwrap();
+        let table = String::from_utf8(output).unwrap();
+        let row = table.lines().nth(1).unwrap();
+        let times: Vec<_> = row.split_whitespace().skip(5).take(2).collect();
+        assert_eq!(times, ["1704067199", "1704067200"]);
+    }
 }

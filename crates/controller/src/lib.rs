@@ -211,12 +211,15 @@ impl AgentRegistration for Registry {
     ) -> Result<Response<HeartbeatResponse>, Status> {
         let request = request.into_inner();
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
-        let agent = agents
+        let Some(agent) = agents
             .get_mut(&request.agent_id)
             .filter(|agent| agent.record.status == AgentStatus::Online)
-            .ok_or_else(|| {
-                Status::not_found(format!("Agent {:?} is not online", request.agent_id))
-            })?;
+        else {
+            return Ok(Response::new(HeartbeatResponse {
+                directive: HeartbeatDirective::Reregister.into(),
+                ..Default::default()
+            }));
+        };
 
         // The Controller owns the lease clock. Agent clocks may differ from it.
         let received_at = Utc::now();

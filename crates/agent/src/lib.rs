@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, error::Error, io, iter, time::Duration};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use sys_analyzer_shared::{
     grpc::{
@@ -10,7 +10,10 @@ use sys_analyzer_shared::{
     parse_controller_url,
 };
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
-use tonic::{Code, Status, transport::Endpoint};
+use tonic::{
+    Code, Status,
+    transport::{Channel, Endpoint},
+};
 use uuid::Uuid;
 
 const CONTROLLER_RETRY_DELAY: Duration = Duration::from_secs(3);
@@ -59,42 +62,55 @@ pub async fn run(controller: &str, mut request: RegisterRequest) -> Result<()> {
     let endpoint =
         controller_endpoint(controller).with_context(|| format!("register Agent {agent_id:?}"))?;
     let mut client = AgentRegistrationClient::new(endpoint.connect_lazy());
-    let session = loop {
-        match client.register(request.clone()).await {
-            Ok(response) => break response.into_inner(),
-            Err(error) if is_retryable_rpc_error(&error) => {
-                eprintln!(
-                    "Registration for Agent {agent_id:?} at {controller} failed and will retry ({error})"
-                );
-                sleep(CONTROLLER_RETRY_DELAY).await;
+    loop {
+        let session = loop {
+            match client.register(request.clone()).await {
+                Ok(response) => break response.into_inner(),
+                Err(error) if is_retryable_rpc_error(&error) => {
+                    eprintln!(
+                        "Registration for Agent {agent_id:?} at {controller} failed and will retry ({error})"
+                    );
+                    sleep(CONTROLLER_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("register Agent {agent_id:?}"));
+                }
             }
-            Err(error) => {
-                return Err(error).with_context(|| format!("register Agent {agent_id:?}"));
-            }
-        }
-    };
-    ensure!(
-        session.heartbeat_interval_ms > 0,
-        "Controller returned a zero heartbeat interval"
-    );
-    let period = Duration::from_millis(session.heartbeat_interval_ms);
+        };
+        ensure!(
+            session.heartbeat_interval_ms > 0,
+            "Controller returned a zero heartbeat interval"
+        );
+        println!(
+            "Agent {agent_id:?} registered with session {}",
+            session.session_id
+        );
+        let period = Duration::from_millis(session.heartbeat_interval_ms);
+        heartbeat_until_reregister(&mut client, &agent_id, period).await?;
+        request.registration_attempt_id = Uuid::new_v4().to_string();
+    }
+}
+
+async fn heartbeat_until_reregister(
+    client: &mut AgentRegistrationClient<Channel>,
+    agent_id: &str,
+    period: Duration,
+) -> Result<()> {
     let mut ticks = interval_at(Instant::now() + period, period);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    println!(
-        "Agent {agent_id:?} registered with session {}",
-        session.session_id
-    );
 
     loop {
         ticks.tick().await;
         let response = client
             .heartbeat(HeartbeatRequest {
-                agent_id: agent_id.clone(),
+                agent_id: agent_id.to_owned(),
                 sent_at_unix_ms: Utc::now().timestamp_millis(),
             })
             .await;
         let response = match response {
             Ok(response) => response.into_inner(),
+            // Older Controllers signal a missing registration with NotFound.
+            Err(error) if error.code() == Code::NotFound => return Ok(()),
             Err(error) if is_retryable_rpc_error(&error) => {
                 eprintln!("Heartbeat for Agent {agent_id:?} failed and will retry ({error})");
                 ticks.reset_after(CONTROLLER_RETRY_DELAY);
@@ -105,11 +121,14 @@ pub async fn run(controller: &str, mut request: RegisterRequest) -> Result<()> {
                     .with_context(|| format!("send heartbeat for Agent {agent_id:?}"));
             }
         };
-        ensure!(
-            response.directive == i32::from(HeartbeatDirective::Continue),
-            "Controller returned unexpected heartbeat directive {} for Agent {agent_id:?}",
-            response.directive
-        );
+        match HeartbeatDirective::try_from(response.directive) {
+            Ok(HeartbeatDirective::Continue) => {}
+            Ok(HeartbeatDirective::Reregister) => return Ok(()),
+            _ => bail!(
+                "Controller returned unexpected heartbeat directive {} for Agent {agent_id:?}",
+                response.directive
+            ),
+        }
     }
 }
 

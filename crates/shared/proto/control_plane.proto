@@ -32,9 +32,11 @@ message HeartbeatRequest {
 enum HeartbeatDirective {
   HEARTBEAT_DIRECTIVE_UNSPECIFIED = 0;
   HEARTBEAT_DIRECTIVE_CONTINUE = 1;
+  HEARTBEAT_DIRECTIVE_REREGISTER = 2;
 }
 
 message HeartbeatResponse {
   HeartbeatDirective directive = 1;
+  // Set only when the heartbeat renews a lease.
   int64 lease_expires_at_unix_ms = 2;
 }

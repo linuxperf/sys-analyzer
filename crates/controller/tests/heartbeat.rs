@@ -61,6 +61,22 @@ async fn registered_agent_heartbeats_renew_the_configured_lease() {
 }
 
 #[tokio::test]
+async fn unknown_agent_heartbeat_requests_reregistration() {
+    let mut client = start_controller().await;
+    let response = client
+        .heartbeat(HeartbeatRequest {
+            agent_id: "unknown-agent".to_owned(),
+            sent_at_unix_ms: Utc::now().timestamp_millis(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.directive(), HeartbeatDirective::Reregister);
+    assert_eq!(response.lease_expires_at_unix_ms, 0);
+}
+
+#[tokio::test]
 async fn replaying_registration_returns_the_original_session() {
     let mut client = start_controller().await;
     let request = RegisterRequest {
