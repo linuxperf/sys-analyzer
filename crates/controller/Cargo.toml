@@ -1,0 +1,17 @@
+[package]
+name = "sys-analyzer-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+chrono.workspace = true
+clap.workspace = true
+serde.workspace = true
+sys-analyzer-shared.workspace = true
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic.workspace = true
+uuid.workspace = true

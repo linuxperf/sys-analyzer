@@ -1,0 +1,17 @@
+[package]
+name = "sys-analyzer-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes = "1"
+clap.workspace = true
+http.workspace = true
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+serde_json.workspace = true
+sys-analyzer-shared.workspace = true
+tokio.workspace = true
+unicode-width = { version = "0.2", default-features = false }
