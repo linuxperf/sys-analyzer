@@ -1,12 +1,22 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, error::Error, io, iter, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
+use chrono::Utc;
 use sys_analyzer_shared::{
-    grpc::{RegisterRequest, RegisterResponse, agent_registration_client::AgentRegistrationClient},
+    grpc::{
+        HeartbeatDirective, HeartbeatRequest, RegisterRequest, RegisterResponse,
+        agent_registration_client::AgentRegistrationClient,
+    },
     parse_controller_url,
 };
-use tonic::transport::Endpoint;
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
+use tonic::{
+    Code, Status,
+    transport::{Channel, Endpoint},
+};
 use uuid::Uuid;
+
+const CONTROLLER_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 pub fn registration_request(
     agent_id: Option<String>,
@@ -23,13 +33,12 @@ pub fn registration_request(
         version: env!("CARGO_PKG_VERSION").to_owned(),
         labels,
         metadata,
+        registration_attempt_id: Uuid::new_v4().to_string(),
     }
 }
 
 pub async fn register(controller: &str, request: RegisterRequest) -> Result<RegisterResponse> {
-    let channel = Endpoint::from(parse_controller_url(controller)?)
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(5))
+    let channel = controller_endpoint(controller)?
         .connect()
         .await
         .with_context(|| format!("connect to Controller at {controller}"))?;
@@ -37,4 +46,108 @@ pub async fn register(controller: &str, request: RegisterRequest) -> Result<Regi
         .register(request)
         .await?;
     Ok(response.into_inner())
+}
+
+fn controller_endpoint(controller: &str) -> Result<Endpoint> {
+    Ok(Endpoint::from(parse_controller_url(controller)?)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5)))
+}
+
+pub async fn run(controller: &str, mut request: RegisterRequest) -> Result<()> {
+    if request.registration_attempt_id.is_empty() {
+        request.registration_attempt_id = Uuid::new_v4().to_string();
+    }
+    let agent_id = request.agent_id.clone();
+    let endpoint =
+        controller_endpoint(controller).with_context(|| format!("register Agent {agent_id:?}"))?;
+    let mut client = AgentRegistrationClient::new(endpoint.connect_lazy());
+    loop {
+        let session = loop {
+            match client.register(request.clone()).await {
+                Ok(response) => break response.into_inner(),
+                Err(error) if is_retryable_rpc_error(&error) => {
+                    eprintln!(
+                        "Registration for Agent {agent_id:?} at {controller} failed and will retry ({error})"
+                    );
+                    sleep(CONTROLLER_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("register Agent {agent_id:?}"));
+                }
+            }
+        };
+        ensure!(
+            session.heartbeat_interval_ms > 0,
+            "Controller returned a zero heartbeat interval"
+        );
+        println!(
+            "Agent {agent_id:?} registered with session {}",
+            session.session_id
+        );
+        let period = Duration::from_millis(session.heartbeat_interval_ms);
+        heartbeat_until_reregister(&mut client, &agent_id, period).await?;
+        request.registration_attempt_id = Uuid::new_v4().to_string();
+    }
+}
+
+async fn heartbeat_until_reregister(
+    client: &mut AgentRegistrationClient<Channel>,
+    agent_id: &str,
+    period: Duration,
+) -> Result<()> {
+    let mut ticks = interval_at(Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        ticks.tick().await;
+        let response = client
+            .heartbeat(HeartbeatRequest {
+                agent_id: agent_id.to_owned(),
+                sent_at_unix_ms: Utc::now().timestamp_millis(),
+            })
+            .await;
+        let response = match response {
+            Ok(response) => response.into_inner(),
+            // Older Controllers signal a missing registration with NotFound.
+            Err(error) if error.code() == Code::NotFound => return Ok(()),
+            Err(error) if is_retryable_rpc_error(&error) => {
+                eprintln!("Heartbeat for Agent {agent_id:?} failed and will retry ({error})");
+                ticks.reset_after(CONTROLLER_RETRY_DELAY);
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("send heartbeat for Agent {agent_id:?}"));
+            }
+        };
+        match HeartbeatDirective::try_from(response.directive) {
+            Ok(HeartbeatDirective::Continue) => {}
+            Ok(HeartbeatDirective::Reregister) => return Ok(()),
+            _ => bail!(
+                "Controller returned unexpected heartbeat directive {} for Agent {agent_id:?}",
+                response.directive
+            ),
+        }
+    }
+}
+
+fn is_retryable_rpc_error(status: &Status) -> bool {
+    // Tonic reports a local RPC timeout as Cancelled.
+    matches!(
+        status.code(),
+        Code::Cancelled | Code::DeadlineExceeded | Code::Unavailable
+    ) || iter::successors(status.source(), |&source| source.source()).any(|source| {
+        // Tonic can report local socket failures as Unknown or Internal.
+        source.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }

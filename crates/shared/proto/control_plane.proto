@@ -4,6 +4,7 @@ package sys_analyzer.control.v1;
 
 service AgentRegistration {
   rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 }
 
 message RegisterRequest {
@@ -13,10 +14,29 @@ message RegisterRequest {
   string version = 4;
   repeated string labels = 5;
   map<string, string> metadata = 6;
+  // Reuse this ID when retrying the same registration. Empty disables replay.
+  string registration_attempt_id = 7;
 }
 
 message RegisterResponse {
   string session_id = 1;
   uint64 heartbeat_interval_ms = 2;
   uint64 lease_timeout_ms = 3;
+}
+
+message HeartbeatRequest {
+  string agent_id = 1;
+  int64 sent_at_unix_ms = 2;
+}
+
+enum HeartbeatDirective {
+  HEARTBEAT_DIRECTIVE_UNSPECIFIED = 0;
+  HEARTBEAT_DIRECTIVE_CONTINUE = 1;
+  HEARTBEAT_DIRECTIVE_REREGISTER = 2;
+}
+
+message HeartbeatResponse {
+  HeartbeatDirective directive = 1;
+  // Set only when the heartbeat renews a lease.
+  int64 lease_expires_at_unix_ms = 2;
 }

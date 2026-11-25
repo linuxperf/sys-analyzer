@@ -4,9 +4,14 @@ import http.client
 import json
 import os
 import re
+import select
+import signal
 import socket
+import socketserver
+import struct
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime
@@ -16,6 +21,7 @@ from uuid import UUID
 
 ROOT = Path(__file__).resolve().parents[1]
 TIMEOUT = 10
+UTC_TIMESTAMP = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$"
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -62,7 +68,16 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(row["labels"], ["test"])
         self.assertEqual(row["metadata"], {"zone": "local"})
         self.assertEqual(row["status"], "Online")
-        self.assertGreater(datetime.fromisoformat(row["registered_at"].replace("Z", "+00:00")).timestamp(), 0)
+        self.assertIs(type(row["registered_at"]), int)
+        connection = http.client.HTTPConnection(rest_addr, timeout=TIMEOUT)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/agents")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        registered, = json.load(response)
+        self.assertRegex(registered["registered_at"], UTC_TIMESTAMP)
+        self.assertEqual(row["registered_at"],
+                         int(datetime.fromisoformat(registered["registered_at"]).timestamp()))
 
         _, table_row = self.cli(rest_addr, "list").stdout.splitlines()
         # Five wide characters occupy ten columns, followed by the column gap.
@@ -95,16 +110,19 @@ class ControlPlaneTests(unittest.TestCase):
 
         output = self.cli("127.0.0.1:0", "--controller", f"http://{rest_addr}", "list")
         header, *table_rows = output.stdout.splitlines()
-        self.assertEqual(re.split(r" {2,}", header), [
+        columns = re.split(r" {2,}", header)
+        self.assertEqual(columns, [
             "Agent ID", "Hostname", "PID", "Version", "Status", "Registered at (UTC)",
-            "Labels", "Metadata",
+            "Last heartbeat (UTC)", "Labels", "Metadata",
         ])
         self.assertEqual(len(table_rows), len(rows))
         for row, table_row in zip(rows, table_rows):
             self.assertTrue(table_row.startswith(row["agent_id"]), table_row)
             self.assertIn(row["hostname"], table_row)
             self.assertIn("Online", table_row)
-            self.assertIn(row["registered_at"].replace("Z", "+00:00"), table_row)
+            values = re.split(r" {2,}", table_row)
+            self.assertEqual(values[columns.index("Registered at (UTC)")],
+                             str(row["registered_at"]))
             self.assertIn(json.dumps(row["labels"]), table_row)
 
     def test_unreachable_controller_exits_with_an_error(self):
@@ -118,13 +136,237 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertIn(f"query Controller at http://{rest_addr}", output.stderr)
         self.assertIn("HTTP request failed", output.stderr)
 
-    def start_controller(self):
-        process, log = self.spawn(
-            "sys-analyzer-controller", "--rest-addr", "127.0.0.1:0", "--grpc-addr", "127.0.0.1:0",
+    def test_agent_retries_when_started_before_the_controller(self):
+        with socket.socket() as reserved_port:
+            reserved_port.bind(("127.0.0.1", 0))
+            host, port = reserved_port.getsockname()
+            grpc_addr = f"{host}:{port}"
+            agent, log = self.start_agent(grpc_addr, "--agent-id", "early-agent")
+            self.wait_for_output(agent, log, r'^Registration for Agent "early-agent" .* will retry')
+            retry_started_at = time.monotonic()
+
+        _, (rest_addr, _) = self.spawn_controller(grpc_addr=grpc_addr)
+        agent_id, _ = self.wait_for_registration(agent, log)
+        self.assertGreaterEqual(time.monotonic() - retry_started_at, 2.5)
+        row, = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+        self.assertEqual(row["agent_id"], agent_id)
+        self.assertEqual(row["pid"], agent.pid)
+        self.assertEqual(row["status"], "Online")
+
+    def test_agent_retries_after_tcp_reset_during_registration_or_heartbeat(self):
+        for stream_id, call in ((1, "Registration"), (3, "Heartbeat")):
+            with self.subTest(call=call):
+                rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
+                proxy_addr, _ = self.start_grpc_reply_proxy(grpc_addr, stream_id, reset=True)
+                agent, log = self.start_agent(proxy_addr, "--agent-id", "reset-agent")
+                self.wait_for_output(agent, log, rf'^{call} for Agent "reset-agent" .*will retry')
+                resumed_at = int(time.time())
+                self.wait_for_registration(agent, log)
+                row = self.wait_for_heartbeat(rest_addr, resumed_at)
+                self.assertEqual(row["pid"], agent.pid)
+                self.assertEqual(row["status"], "Online")
+
+    def test_agent_replays_registration_after_its_committed_reply_times_out(self):
+        rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
+        proxy_addr, release_reply = self.start_grpc_reply_proxy(grpc_addr, 1)
+        agent, log = self.start_agent(proxy_addr, "--agent-id", "replay-agent")
+        try:
+            self.wait_for_output(agent, log, r'^Registration for Agent "replay-agent" .*will retry')
+            original, = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+            self.assertEqual(original["status"], "Online")
+            self.assertIsNone(original["last_heartbeat_at"])
+        finally:
+            release_reply.set()
+
+        resumed_at = int(time.time())
+        self.wait_for_registration(agent, log)
+        row = self.wait_for_heartbeat(rest_addr, resumed_at)
+        self.assertEqual(row["registered_at"], original["registered_at"])
+        self.assertEqual(row["pid"], agent.pid)
+
+    def test_concurrent_agents_keep_reporting_heartbeats_to_the_cli(self):
+        lease_timeout_seconds = 1
+        rest_addr, grpc_addr = self.start_controller(
+            "--heartbeat-interval-ms", "100", "--lease-timeout-ms", str(lease_timeout_seconds * 1000),
         )
-        return self.wait_for_output(
+        processes = [self.start_agent(grpc_addr, "--agent-id", agent_id)
+                     for agent_id in ("first", "second")]
+        agent_ids = {self.wait_for_registration(*process)[0] for process in processes}
+
+        initial_rows = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+        registrations = {row["agent_id"]: row["registered_at"] for row in initial_rows}
+        self.assertEqual(registrations.keys(), agent_ids)
+        last_seen = registrations.copy()
+        initial_expiries = {agent_id: registered_at + lease_timeout_seconds
+                            for agent_id, registered_at in registrations.items()}
+        rounds = dict.fromkeys(agent_ids, 0)
+        first_table = None
+        deadline = time.monotonic() + TIMEOUT
+        while time.monotonic() < deadline:
+            rows = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+            self.assertEqual({row["agent_id"]: row["registered_at"] for row in rows}, registrations)
+            for row in rows:
+                agent_id = row["agent_id"]
+                self.assertEqual(row["status"], "Online")
+                heartbeat = row["last_heartbeat_at"]
+                if heartbeat is not None:
+                    self.assertIs(type(heartbeat), int)
+                    self.assertGreaterEqual(heartbeat, last_seen[agent_id])
+                    if heartbeat > last_seen[agent_id]:
+                        last_seen[agent_id] = heartbeat
+                        rounds[agent_id] += 1
+            if first_table is None and min(rounds.values()) >= 1:
+                first_table = self.table_heartbeats(rest_addr)
+                self.assertEqual(first_table.keys(), agent_ids)
+            if first_table is not None and all(
+                rounds[agent_id] >= 3
+                and last_seen[agent_id] > initial_expiries[agent_id]
+                and last_seen[agent_id] > first_table[agent_id]
+                for agent_id in agent_ids
+            ):
+                break
+            time.sleep(0.025)
+        self.assertGreaterEqual(min(rounds.values()), 3, rounds)
+        self.assertIsNotNone(first_table)
+        final_table = self.table_heartbeats(rest_addr)
+        self.assertEqual(final_table.keys(), agent_ids)
+        for agent_id in agent_ids:
+            self.assertGreater(last_seen[agent_id], initial_expiries[agent_id], agent_id)
+            self.assertGreater(final_table[agent_id], first_table[agent_id], agent_id)
+            self.assertGreaterEqual(final_table[agent_id], last_seen[agent_id], agent_id)
+
+    def test_agent_resumes_heartbeats_after_a_timed_out_call(self):
+        controller, (rest_addr, grpc_addr) = self.spawn_controller(
+            "--heartbeat-interval-ms", "100", "--lease-timeout-ms", "15000",
+        )
+        agent, log = self.start_agent(grpc_addr, "--agent-id", "resilient")
+        self.wait_for_registration(agent, log)
+        initial, = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+
+        controller.send_signal(signal.SIGSTOP)
+        try:
+            self.wait_for_output(agent, log, r'^Heartbeat for Agent "resilient" failed and will retry')
+        finally:
+            controller.send_signal(signal.SIGCONT)
+
+        row = self.wait_for_heartbeat(rest_addr, int(time.time()))
+        self.assertEqual(row["status"], "Online")
+        self.assertEqual(row["registered_at"], initial["registered_at"])
+
+    def test_agent_reregisters_after_the_controller_restarts(self):
+        controller, (rest_addr, grpc_addr) = self.spawn_controller("--heartbeat-interval-ms", "100")
+        agent, log = self.start_agent(
+            grpc_addr, "--agent-id", "restart-agent", "--label", "restart", "--metadata", "zone=local",
+        )
+        agent_id, original_session = self.wait_for_registration(agent, log)
+        original = self.wait_for_heartbeat(rest_addr, int(time.time()))
+
+        self.stop_process(controller)
+        self.wait_for_output(agent, log, r'^Heartbeat for Agent "restart-agent" failed and will retry')
+        restarted_at = int(time.time())
+        _, (rest_addr, _) = self.spawn_controller("--heartbeat-interval-ms", "50", grpc_addr=grpc_addr)
+
+        self.wait_for_output(
+            agent, log,
+            rf'^Agent "restart-agent" registered with session (?!{original_session}$)[0-9a-f-]+$',
+        )
+        row = self.wait_for_heartbeat(rest_addr, restarted_at)
+        self.assertIsNone(agent.poll())
+        self.assertEqual(row["agent_id"], agent_id)
+        self.assertEqual(row["pid"], agent.pid)
+        self.assertEqual(row["status"], "Online")
+        self.assertEqual(row["labels"], original["labels"])
+        self.assertEqual(row["metadata"], original["metadata"])
+        self.assertGreater(row["registered_at"], original["registered_at"])
+
+    def wait_for_heartbeat(self, rest_addr, after):
+        deadline = time.monotonic() + TIMEOUT
+        while time.monotonic() < deadline:
+            row, = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+            heartbeat = row["last_heartbeat_at"]
+            if heartbeat is not None and heartbeat > after:
+                return row
+            time.sleep(0.025)
+        self.fail("Agent did not report a new heartbeat")
+
+    def start_grpc_reply_proxy(self, grpc_addr, stream_id, *, reset=False):
+        upstream_host, upstream_port = grpc_addr.split(":")
+        upstream_addr = (upstream_host, int(upstream_port))
+        fault_injected = threading.Event()
+        release_reply = threading.Event()
+
+        class Relay(socketserver.BaseRequestHandler):
+            def handle(self):
+                downstream = self.request
+                try:
+                    with socket.create_connection(upstream_addr, timeout=TIMEOUT) as upstream:
+                        self.relay(downstream, upstream)
+                except (ConnectionError, TimeoutError):
+                    pass
+
+            def relay(self, downstream, upstream):
+                pending = bytearray()
+                while readable := select.select([downstream, upstream], [], [], TIMEOUT)[0]:
+                    if downstream in readable:
+                        data = downstream.recv(65536)
+                        if not data:
+                            return
+                        upstream.sendall(data)
+                    if upstream not in readable:
+                        continue
+                    data = upstream.recv(65536)
+                    if not data:
+                        return
+                    pending.extend(data)
+                    # The HTTP/2 frame header gives the length and stream ID.
+                    while len(pending) >= 9:
+                        frame_end = 9 + int.from_bytes(pending[0:3], "big")
+                        if len(pending) < frame_end:
+                            break
+                        reply_stream = int.from_bytes(pending[5:9], "big") & 0x7fffffff
+                        if pending[3] == 0x01 and reply_stream == stream_id and not fault_injected.is_set():
+                            fault_injected.set()
+                            if reset:
+                                downstream.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                                downstream.close()
+                                return
+                            if not release_reply.wait(TIMEOUT):
+                                return
+                        downstream.sendall(pending[:frame_end])
+                        del pending[:frame_end]
+
+        proxy = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Relay)
+        proxy.daemon_threads = True
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.server_close)
+        self.addCleanup(proxy.shutdown)
+        self.addCleanup(release_reply.set)
+        host, port = proxy.server_address
+        return f"{host}:{port}", release_reply
+
+    def table_heartbeats(self, rest_addr):
+        header, *table_rows = self.cli(rest_addr, "list").stdout.splitlines()
+        columns = re.split(r" {2,}", header)
+        heartbeat_column = columns.index("Last heartbeat (UTC)")
+        heartbeats = {}
+        for table_row in table_rows:
+            values = re.split(r" {2,}", table_row)
+            heartbeats[values[0]] = int(values[heartbeat_column])
+        return heartbeats
+
+    def start_controller(self, *args):
+        _, addresses = self.spawn_controller(*args)
+        return addresses
+
+    def spawn_controller(self, *args, grpc_addr="127.0.0.1:0"):
+        process, log = self.spawn(
+            "sys-analyzer-controller", "--rest-addr", "127.0.0.1:0", "--grpc-addr", grpc_addr,
+            *args,
+        )
+        addresses = self.wait_for_output(
             process, log, r"^Controller listening on REST (127\.0\.0\.1:\d+) and gRPC (127\.0\.0\.1:\d+)$",
         ).groups()
+        return process, addresses
 
     def start_agent(self, grpc_addr, *args):
         env = os.environ.copy()

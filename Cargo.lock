@@ -964,6 +964,7 @@ name = "sys-analyzer-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "rustix",
  "sys-analyzer-shared",
@@ -978,10 +979,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
  "clap",
  "http",
  "http-body-util",
  "hyper-util",
+ "serde",
  "serde_json",
  "sys-analyzer-shared",
  "tokio",

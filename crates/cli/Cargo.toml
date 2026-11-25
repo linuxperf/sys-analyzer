@@ -7,10 +7,12 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 bytes = "1"
+chrono.workspace = true
 clap.workspace = true
 http.workspace = true
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+serde.workspace = true
 serde_json.workspace = true
 sys-analyzer-shared.workspace = true
 tokio.workspace = true
