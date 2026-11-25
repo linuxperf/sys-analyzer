@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use chrono::{SecondsFormat, SubsecRound};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use http::Uri;
 use http_body_util::{BodyExt, Empty};
@@ -48,12 +48,14 @@ async fn main() -> Result<()> {
     match output {
         Output::Table => write_table(&mut writer, &agents)?,
         Output::Json => {
-            let mut agents = agents;
-            for agent in &mut agents {
-                agent.registered_at = agent.registered_at.trunc_subsecs(0);
-                agent.last_heartbeat_at = agent.last_heartbeat_at.map(|time| time.trunc_subsecs(0));
+            let mut rows = Vec::with_capacity(agents.len());
+            for agent in &agents {
+                let mut row = serde_json::to_value(agent)?;
+                row["registered_at"] = format_utc_clock(agent.registered_at).into();
+                row["last_heartbeat_at"] = agent.last_heartbeat_at.map(format_utc_clock).into();
+                rows.push(row);
             }
-            serde_json::to_writer_pretty(&mut writer, &agents)?;
+            serde_json::to_writer_pretty(&mut writer, &rows)?;
             writeln!(writer)?;
         }
     }
@@ -107,13 +109,10 @@ fn write_table(writer: &mut impl Write, agents: &[AgentRecord]) -> Result<()> {
             agent.pid.to_string(),
             escape_control(&agent.version),
             format!("{:?}", agent.status),
+            format_utc_clock(agent.registered_at),
             agent
-                .registered_at
-                .to_rfc3339_opts(SecondsFormat::Secs, true),
-            agent.last_heartbeat_at.map_or_else(
-                || "-".to_owned(),
-                |time| time.to_rfc3339_opts(SecondsFormat::Secs, true),
-            ),
+                .last_heartbeat_at
+                .map_or_else(|| "-".to_owned(), format_utc_clock),
             escape_control(&serde_json::to_string(&agent.labels)?),
             escape_control(&serde_json::to_string(&agent.metadata)?),
         ]);
@@ -135,6 +134,10 @@ fn write_table(writer: &mut impl Write, agents: &[AgentRecord]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn format_utc_clock(time: DateTime<Utc>) -> String {
+    time.format("%H:%M:%S").to_string()
 }
 
 fn escape_control(value: &str) -> String {

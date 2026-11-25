@@ -30,7 +30,7 @@ curl http://127.0.0.1:8080/health
 
 `GET /health` 返回 `{"status":"ok"}`。`GET /agents` 返回 Agent 列表。注册记录保存在 Controller 内存中，重启 Controller 会清空列表。
 
-`list` 以秒级 UTC 格式展示注册时间和 Controller 收到的最近一次心跳时间，例如 `2026-11-25T13:31:08Z`。第一次心跳到达前，表格显示 `-`，JSON 的 `last_heartbeat_at` 为 `null`。
+`list` 的表格和 JSON 都以 UTC 时分秒展示注册时间和 Controller 收到的最近一次心跳时间，例如 `13:31:08`。第一次心跳到达前，表格显示 `-`，JSON 的 `last_heartbeat_at` 为 `null`。
 心跳 RPC 超时或连接暂时不可用时，Agent 会在后续周期重试。
 
 ## 地址配置
