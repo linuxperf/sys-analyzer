@@ -1,0 +1,18 @@
+[package]
+name = "sys-analyzer-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+http.workspace = true
+prost = "0.14"
+serde.workspace = true
+tonic.workspace = true
+tonic-prost = "0.14"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"
