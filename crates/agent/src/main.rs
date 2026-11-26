@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use sys_analyzer_agent::{registration_request, run};
+use sys_analyzer_agent::run;
 use sys_analyzer_shared::DEFAULT_GRPC_ADDR;
 
 #[derive(Parser)]
@@ -19,12 +19,13 @@ struct Args {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let request = registration_request(
+    run(
+        &args.controller,
         args.agent_id,
         args.labels,
         args.metadata.into_iter().collect(),
-    );
-    run(&args.controller, request).await
+    )
+    .await
 }
 
 fn parse_metadata(entry: &str) -> Result<(String, String), String> {
