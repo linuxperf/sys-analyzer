@@ -5,6 +5,7 @@ package sys_analyzer.control.v1;
 service AgentRegistration {
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
 }
 
 message RegisterRequest {
@@ -27,12 +28,15 @@ message RegisterResponse {
 message HeartbeatRequest {
   string agent_id = 1;
   int64 sent_at_unix_ms = 2;
+  // The session ID returned by Register. Older clients omit this field.
+  optional string session_id = 3;
 }
 
 enum HeartbeatDirective {
   HEARTBEAT_DIRECTIVE_UNSPECIFIED = 0;
   HEARTBEAT_DIRECTIVE_CONTINUE = 1;
   HEARTBEAT_DIRECTIVE_REREGISTER = 2;
+  HEARTBEAT_DIRECTIVE_STOP = 3;
 }
 
 message HeartbeatResponse {
@@ -40,3 +44,12 @@ message HeartbeatResponse {
   // Set only when the heartbeat renews a lease.
   int64 lease_expires_at_unix_ms = 2;
 }
+
+message DeregisterRequest {
+  string agent_id = 1;
+  string reason = 2;
+  // The current session ID returned by Register.
+  string session_id = 3;
+}
+
+message DeregisterResponse {}

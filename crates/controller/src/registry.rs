@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, ensure};
 use chrono::{DateTime, TimeDelta, Utc};
-use sys_analyzer_shared::{AgentRecord, AgentStatus};
+use sys_analyzer_shared::{AgentDetail, AgentRecord, AgentStatus};
 use uuid::Uuid;
 
 #[derive(Clone, Copy)]
@@ -66,19 +66,59 @@ pub(super) struct RegisteredSession {
 pub(super) enum Heartbeat {
     Renewed { lease_expires_at: DateTime<Utc> },
     Reregister,
+    Stop,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum RegistryError {
     BlankAgentId,
     AlreadyRegistered(String),
+    AgentDisabled(String),
     LeaseExpirationOutOfRange,
+    InvalidSessionId,
+    UnknownSession(String),
+}
+
+pub(super) enum ManagementAction {
+    Disable,
+    Enable,
+}
+
+pub(super) enum ManagementError {
+    Missing,
+    AlreadyDisabled,
+    NotDisabled,
 }
 
 struct RegisteredAgent {
     record: AgentRecord,
-    session_id: Uuid,
+    session_id: Option<Uuid>,
     registration_attempt_id: String,
+    lease_expires_at: DateTime<Utc>,
+    offline_since: Option<DateTime<Utc>>,
+}
+
+impl RegisteredAgent {
+    fn has_active_lease(&self, now: DateTime<Utc>) -> bool {
+        self.record.status == AgentStatus::Online && now < self.lease_expires_at
+    }
+
+    fn effective_status(&self, now: DateTime<Utc>) -> AgentStatus {
+        match self.record.status {
+            AgentStatus::Online if !self.has_active_lease(now) => AgentStatus::Offline,
+            status => status,
+        }
+    }
+
+    fn detail(&self, status: AgentStatus) -> AgentDetail {
+        AgentDetail {
+            record: AgentRecord {
+                status,
+                ..self.record.clone()
+            },
+            lease_expires_at: self.lease_expires_at,
+        }
+    }
 }
 
 pub(super) struct Registry {
@@ -108,19 +148,24 @@ impl Registry {
         }
 
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
-        let session_id = match agents.entry(request.agent_id.clone()) {
-            Entry::Occupied(entry)
-                if !request.attempt_id.is_empty()
-                    && request.attempt_id == entry.get().registration_attempt_id =>
+        let registered_at = (self.clock)();
+        let previous = agents.get(&request.agent_id);
+        if previous.is_some_and(|agent| agent.record.status == AgentStatus::Disabled) {
+            return Err(RegistryError::AgentDisabled(request.agent_id));
+        }
+        let online_agent = previous.filter(|agent| agent.has_active_lease(registered_at));
+        let session_id = if let Some(agent) = online_agent {
+            if request.attempt_id.is_empty() || request.attempt_id != agent.registration_attempt_id
             {
-                entry.get().session_id
+                return Err(RegistryError::AlreadyRegistered(request.agent_id));
             }
-            Entry::Occupied(_) => return Err(RegistryError::AlreadyRegistered(request.agent_id)),
-            Entry::Vacant(entry) => {
-                let registered_at = (self.clock)();
-                self.heartbeat.lease_expires_at(registered_at)?;
-                let session_id = Uuid::new_v4();
-                entry.insert(RegisteredAgent {
+            agent.session_id.expect("online Agent has a session")
+        } else {
+            let lease_expires_at = self.heartbeat.lease_expires_at(registered_at)?;
+            let session_id = Uuid::new_v4();
+            agents.insert(
+                request.agent_id.clone(),
+                RegisteredAgent {
                     record: AgentRecord {
                         agent_id: request.agent_id,
                         hostname: request.hostname,
@@ -132,11 +177,13 @@ impl Registry {
                         registered_at,
                         last_heartbeat_at: None,
                     },
-                    session_id,
+                    session_id: Some(session_id),
                     registration_attempt_id: request.attempt_id,
-                });
-                session_id
-            }
+                    lease_expires_at,
+                    offline_since: None,
+                },
+            );
+            session_id
         };
 
         Ok(RegisteredSession {
@@ -146,22 +193,122 @@ impl Registry {
         })
     }
 
-    pub(super) fn heartbeat(&self, agent_id: &str) -> Result<Heartbeat, RegistryError> {
+    pub(super) fn heartbeat(
+        &self,
+        agent_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Heartbeat, RegistryError> {
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
         let Some(agent) = agents.get_mut(agent_id) else {
             return Ok(Heartbeat::Reregister);
         };
+        if agent.record.status == AgentStatus::Disabled {
+            return Ok(Heartbeat::Stop);
+        }
 
+        let matches_session = session_id.is_none_or(|session_id| {
+            Uuid::parse_str(session_id).is_ok_and(|id| agent.session_id == Some(id))
+        });
         // Read Controller time while holding the lock so renewal follows mutation order.
         let received_at = (self.clock)();
+        if !matches_session || !agent.has_active_lease(received_at) {
+            return Ok(Heartbeat::Reregister);
+        }
         let lease_expires_at = self.heartbeat.lease_expires_at(received_at)?;
         agent.record.last_heartbeat_at = Some(received_at);
+        agent.lease_expires_at = lease_expires_at;
         Ok(Heartbeat::Renewed { lease_expires_at })
     }
 
-    pub(super) fn snapshot(&self) -> Vec<AgentRecord> {
+    pub(super) fn sweep(&self, offline_retention: TimeDelta) {
+        let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
+        let now = (self.clock)();
+        agents.retain(|_, agent| match agent.record.status {
+            AgentStatus::Online => {
+                if now >= agent.lease_expires_at {
+                    agent.record.status = AgentStatus::Offline;
+                    agent.offline_since = Some(now);
+                }
+                true
+            }
+            AgentStatus::Offline => agent
+                .offline_since
+                .is_none_or(|offline_since| now - offline_since < offline_retention),
+            AgentStatus::Disabled => true,
+        });
+    }
+
+    pub(super) fn deregister(&self, agent_id: &str, session_id: &str) -> Result<(), RegistryError> {
+        if agent_id.trim().is_empty() {
+            return Err(RegistryError::BlankAgentId);
+        }
+        let session_id =
+            Uuid::parse_str(session_id).map_err(|_| RegistryError::InvalidSessionId)?;
+        let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
+        match agents.entry(agent_id.to_owned()) {
+            Entry::Occupied(entry) if entry.get().session_id == Some(session_id) => {
+                entry.remove();
+                Ok(())
+            }
+            _ => Err(RegistryError::UnknownSession(agent_id.to_owned())),
+        }
+    }
+
+    pub(super) fn snapshot(&self, status: Option<AgentStatus>) -> Vec<AgentRecord> {
         let agents = self.agents.lock().expect("Agent registry lock poisoned");
-        agents.values().map(|agent| agent.record.clone()).collect()
+        let now = (self.clock)();
+        agents
+            .values()
+            .filter_map(|agent| {
+                let effective_status = agent.effective_status(now);
+                status
+                    .is_none_or(|status| status == effective_status)
+                    .then(|| AgentRecord {
+                        status: effective_status,
+                        ..agent.record.clone()
+                    })
+            })
+            .collect()
+    }
+
+    pub(super) fn detail(&self, agent_id: &str) -> Option<AgentDetail> {
+        let agents = self.agents.lock().expect("Agent registry lock poisoned");
+        let agent = agents.get(agent_id)?;
+        Some(agent.detail(agent.effective_status((self.clock)())))
+    }
+
+    pub(super) fn manage(
+        &self,
+        agent_id: &str,
+        action: ManagementAction,
+    ) -> Result<AgentDetail, ManagementError> {
+        let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
+        let agent = agents.get_mut(agent_id).ok_or(ManagementError::Missing)?;
+        match (action, agent.record.status) {
+            (ManagementAction::Disable, AgentStatus::Disabled) => {
+                return Err(ManagementError::AlreadyDisabled);
+            }
+            (ManagementAction::Disable, _) => {
+                agent.record.status = AgentStatus::Disabled;
+                // Revoke the session so a delayed Deregister cannot discard the record.
+                agent.session_id = None;
+                agent.offline_since = None;
+            }
+            (ManagementAction::Enable, AgentStatus::Disabled) => {
+                agent.record.status = AgentStatus::Offline;
+                agent.offline_since = Some((self.clock)());
+            }
+            (ManagementAction::Enable, _) => return Err(ManagementError::NotDisabled),
+        }
+        Ok(agent.detail(agent.record.status))
+    }
+
+    pub(super) fn remove(&self, agent_id: &str) -> Result<(), ManagementError> {
+        let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
+        agents
+            .remove(agent_id)
+            .map(|_| ())
+            .ok_or(ManagementError::Missing)
     }
 }
 
@@ -197,47 +344,38 @@ mod tests {
         let (registry, now) = registry(start);
         let original_session = registry.register(registration("first-attempt")).unwrap();
         *now.lock().unwrap() = start + TimeDelta::milliseconds(25);
-        registry.heartbeat("test-agent").unwrap();
-        let original_snapshot = registry.snapshot();
+        registry.heartbeat("test-agent", None).unwrap();
+        let original_snapshot = registry.snapshot(None);
 
-        *now.lock().unwrap() = start + TimeDelta::seconds(2);
+        *now.lock().unwrap() = start + TimeDelta::milliseconds(500);
         let mut retry = registration("first-attempt");
         retry
             .metadata
             .insert("zone".to_owned(), "remote".to_owned());
         retry.hostname = "different-host".to_owned();
         assert_eq!(registry.register(retry).unwrap(), original_session);
-        assert_eq!(registry.snapshot(), original_snapshot);
+        assert_eq!(registry.snapshot(None), original_snapshot);
     }
 
     #[test]
-    fn registered_agent_stays_online_and_can_renew_past_the_lease_deadline() {
+    fn heartbeat_at_the_lease_deadline_requires_reregistration() {
         let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let (registry, now) = registry(start);
         let session = registry.register(registration("first-attempt")).unwrap();
         assert_eq!(session.lease_timeout_ms, 1_000);
 
-        let received_at = start + TimeDelta::seconds(2);
+        let received_at = start + TimeDelta::seconds(1);
         *now.lock().unwrap() = received_at;
-        let before = registry.snapshot();
+        let before = registry.snapshot(None);
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].status, AgentStatus::Online);
+        assert_eq!(before[0].status, AgentStatus::Offline);
         assert_eq!(before[0].registered_at, start);
         assert_eq!(before[0].last_heartbeat_at, None);
         assert_eq!(
-            registry.register(registration("different-attempt")),
-            Err(RegistryError::AlreadyRegistered("test-agent".to_owned()))
+            registry.heartbeat("test-agent", None).unwrap(),
+            Heartbeat::Reregister
         );
-        assert_eq!(
-            registry.heartbeat("test-agent").unwrap(),
-            Heartbeat::Renewed {
-                lease_expires_at: received_at + TimeDelta::seconds(1),
-            }
-        );
-
-        let mut expected = before;
-        expected[0].last_heartbeat_at = Some(received_at);
-        assert_eq!(registry.snapshot(), expected);
+        assert_eq!(registry.snapshot(None), before);
     }
 
     #[test]
@@ -247,23 +385,23 @@ mod tests {
             registry.register(registration("first-attempt")),
             Err(RegistryError::LeaseExpirationOutOfRange)
         );
-        assert!(registry.snapshot().is_empty());
+        assert!(registry.snapshot(None).is_empty());
 
-        let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let start = DateTime::<Utc>::MAX_UTC - TimeDelta::milliseconds(1_050);
         *now.lock().unwrap() = start;
         registry.register(registration("second-attempt")).unwrap();
         let first_heartbeat_at = start + TimeDelta::milliseconds(25);
         *now.lock().unwrap() = first_heartbeat_at;
-        registry.heartbeat("test-agent").unwrap();
-        let before = registry.snapshot();
+        registry.heartbeat("test-agent", None).unwrap();
+        let before = registry.snapshot(None);
         assert_eq!(before[0].last_heartbeat_at, Some(first_heartbeat_at));
 
-        *now.lock().unwrap() = DateTime::<Utc>::MAX_UTC;
+        *now.lock().unwrap() = DateTime::<Utc>::MAX_UTC - TimeDelta::milliseconds(500);
         assert_eq!(
-            registry.heartbeat("test-agent"),
+            registry.heartbeat("test-agent", None),
             Err(RegistryError::LeaseExpirationOutOfRange)
         );
-        assert_eq!(registry.snapshot(), before);
+        assert_eq!(registry.snapshot(None), before);
     }
 
     #[test]
@@ -271,10 +409,10 @@ mod tests {
         let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let (registry, _) = registry(start);
         assert_eq!(
-            registry.heartbeat("unknown-agent"),
+            registry.heartbeat("unknown-agent", None),
             Ok(Heartbeat::Reregister)
         );
-        assert!(registry.snapshot().is_empty());
+        assert!(registry.snapshot(None).is_empty());
     }
 
     #[test]
@@ -296,6 +434,6 @@ mod tests {
         assert!(outcomes.contains(&Err(RegistryError::AlreadyRegistered(
             "test-agent".to_owned()
         ))));
-        assert_eq!(registry.snapshot().len(), 1);
+        assert_eq!(registry.snapshot(None).len(), 1);
     }
 }

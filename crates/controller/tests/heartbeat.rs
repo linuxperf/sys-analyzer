@@ -40,13 +40,14 @@ async fn registered_agent_heartbeats_renew_the_configured_lease() {
     assert_eq!(registration.lease_timeout_ms, 1_000);
 
     let mut previous_expiry = 0;
-    for sent_at_unix_ms in [-1, i64::MAX] {
+    for (sent_at_unix_ms, session_id) in [(-1, None), (i64::MAX, Some(registration.session_id))] {
         tokio::time::sleep(Duration::from_millis(25)).await;
         let before = Utc::now().timestamp_millis();
         let response = client
             .heartbeat(HeartbeatRequest {
                 agent_id: "test-agent".to_owned(),
                 sent_at_unix_ms,
+                session_id,
             })
             .await
             .unwrap()
@@ -67,6 +68,7 @@ async fn unknown_agent_heartbeat_requests_reregistration() {
         .heartbeat(HeartbeatRequest {
             agent_id: "unknown-agent".to_owned(),
             sent_at_unix_ms: Utc::now().timestamp_millis(),
+            session_id: None,
         })
         .await
         .unwrap()

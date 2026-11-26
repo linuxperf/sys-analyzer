@@ -4,8 +4,8 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use sys_analyzer_shared::{
     grpc::{
-        HeartbeatDirective, HeartbeatRequest, HeartbeatResponse, RegisterRequest,
-        agent_registration_client::AgentRegistrationClient,
+        DeregisterRequest, HeartbeatDirective, HeartbeatRequest, HeartbeatResponse,
+        RegisterRequest, agent_registration_client::AgentRegistrationClient,
     },
     parse_controller_url,
 };
@@ -61,16 +61,40 @@ impl Controller for GrpcController {
         })
     }
 
-    async fn heartbeat(&mut self, agent_id: &str) -> Result<Heartbeat, RpcError> {
+    async fn heartbeat(&mut self, agent_id: &str, session_id: &str) -> Result<Heartbeat, RpcError> {
         let response = self
             .client
             .heartbeat(HeartbeatRequest {
                 agent_id: agent_id.to_owned(),
                 sent_at_unix_ms: Utc::now().timestamp_millis(),
+                session_id: Some(session_id.to_owned()),
             })
             .await;
 
         heartbeat_outcome(agent_id, response)
+    }
+
+    async fn deregister(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<(), RpcError> {
+        match self
+            .client
+            .deregister(DeregisterRequest {
+                agent_id: agent_id.to_owned(),
+                reason: reason.to_owned(),
+                session_id: session_id.to_owned(),
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::NotFound => Ok(()),
+            Err(status) => Err(classify_error(status, || {
+                format!("deregister Agent {agent_id:?}")
+            })),
+        }
     }
 }
 
@@ -92,6 +116,7 @@ fn heartbeat_outcome(
     match HeartbeatDirective::try_from(directive) {
         Ok(HeartbeatDirective::Continue) => Ok(Heartbeat::Continue),
         Ok(HeartbeatDirective::Reregister) => Ok(Heartbeat::Reregister),
+        Ok(HeartbeatDirective::Stop) => Ok(Heartbeat::Stop),
         _ => Err(RpcError::Fatal(anyhow!(
             "Controller returned unexpected heartbeat directive {directive} for Agent {agent_id:?}"
         ))),

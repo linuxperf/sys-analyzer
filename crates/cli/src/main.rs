@@ -4,20 +4,26 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use chrono::DateTime;
 use clap::{Parser, Subcommand, ValueEnum};
-use http::Uri;
+use http::{Method, Request, Uri, uri::PathAndQuery};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use serde::Serialize;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use serde::{Serialize, de::DeserializeOwned};
 use sys_analyzer_shared::{
-    AGENTS_PATH, AgentRecord, AgentStatus, DEFAULT_REST_ADDR, parse_controller_url,
+    AGENTS_PATH, AgentDetail, AgentRecord, AgentStatus, DEFAULT_REST_ADDR, ErrorBody,
+    parse_controller_url,
 };
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Parser)]
-#[command(version, about = "Query the sys-analyzer Controller")]
+#[command(
+    version,
+    about = "Query and manage Agents through the sys-analyzer Controller"
+)]
 struct Args {
     #[arg(long, global = true, env = "SYS_ANALYZER_REST_URL", default_value_t = format!("http://{DEFAULT_REST_ADDR}"))]
     controller: String,
@@ -29,9 +35,33 @@ struct Args {
 enum Command {
     /// List registered Agents
     List {
+        #[arg(long, value_enum, ignore_case = true)]
+        status: Option<StatusFilter>,
         #[arg(short, long, value_enum, default_value_t = Output::Table)]
         output: Output,
     },
+    /// Show a registered Agent and its lease
+    Show(AgentCommand),
+    /// Disable an Agent and request that it stop
+    Disable(AgentCommand),
+    /// Enable an Agent to register again
+    Enable(AgentCommand),
+    /// Remove an Agent record
+    Remove(AgentCommand),
+}
+
+#[derive(clap::Args)]
+struct AgentCommand {
+    agent_id: String,
+    #[arg(short, long, value_enum, default_value_t = Output::Table)]
+    output: Output,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum StatusFilter {
+    Online,
+    Offline,
+    Disabled,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -53,6 +83,13 @@ struct AgentListRow<'a> {
     last_heartbeat_at: Option<i64>,
 }
 
+#[derive(Serialize)]
+struct AgentDetailRow<'a> {
+    #[serde(flatten)]
+    agent: AgentListRow<'a>,
+    lease_expires_at: i64,
+}
+
 impl<'a> From<&'a AgentRecord> for AgentListRow<'a> {
     fn from(agent: &'a AgentRecord) -> Self {
         Self {
@@ -72,51 +109,166 @@ impl<'a> From<&'a AgentRecord> for AgentListRow<'a> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let Command::List { output } = args.command;
-    let agents = list_agents(&args.controller)
-        .await
-        .with_context(|| format!("query Controller at {}", args.controller))?;
-
-    let mut writer = io::stdout().lock();
-    write_list(&mut writer, &agents, output)?;
-    writer.flush()?;
+    let stdout = io::stdout();
+    match args.command {
+        Command::List { status, output } => {
+            let path = match status {
+                Some(status) => {
+                    let value = status.to_possible_value().expect("valid status filter");
+                    PathAndQuery::try_from(format!("{AGENTS_PATH}?status={}", value.get_name()))?
+                }
+                None => PathAndQuery::from_static(AGENTS_PATH),
+            };
+            let agents: Vec<AgentRecord> = request_json(&args.controller, Method::GET, path)
+                .await
+                .with_context(|| format!("query Controller at {}", args.controller))?;
+            write_list(&mut stdout.lock(), &agents, output)?;
+        }
+        Command::Show(target) => {
+            let detail = request_agent_detail(&args.controller, &target.agent_id, None).await?;
+            write_detail(&mut stdout.lock(), &detail, target.output)?;
+        }
+        Command::Disable(target) => {
+            let detail =
+                request_agent_detail(&args.controller, &target.agent_id, Some("disable")).await?;
+            write_detail(&mut stdout.lock(), &detail, target.output)?;
+        }
+        Command::Enable(target) => {
+            let detail =
+                request_agent_detail(&args.controller, &target.agent_id, Some("enable")).await?;
+            write_detail(&mut stdout.lock(), &detail, target.output)?;
+        }
+        Command::Remove(target) => {
+            let agent_id = &target.agent_id;
+            request_controller(
+                &args.controller,
+                Method::DELETE,
+                agent_path(agent_id, None)?,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "remove Agent {agent_id:?} at Controller {}",
+                    args.controller
+                )
+            })?;
+            write_removal(&mut stdout.lock(), agent_id, target.output)?;
+        }
+    }
+    stdout.lock().flush()?;
     Ok(())
 }
 
-async fn list_agents(controller: &str) -> Result<Vec<AgentRecord>> {
+fn agent_path(agent_id: &str, action: Option<&str>) -> Result<PathAndQuery> {
+    let encoded_id = utf8_percent_encode(agent_id, NON_ALPHANUMERIC);
+    let path = match action {
+        Some(action) => format!("{AGENTS_PATH}/{encoded_id}/{action}"),
+        None => format!("{AGENTS_PATH}/{encoded_id}"),
+    };
+    Ok(PathAndQuery::try_from(path)?)
+}
+
+async fn request_agent_detail(
+    controller: &str,
+    agent_id: &str,
+    action: Option<&str>,
+) -> Result<AgentDetail> {
+    let method = if action.is_some() {
+        Method::POST
+    } else {
+        Method::GET
+    };
+    request_json(controller, method, agent_path(agent_id, action)?)
+        .await
+        .with_context(|| {
+            let operation = action.unwrap_or("query");
+            format!("{operation} Agent {agent_id:?} at Controller {controller}")
+        })
+}
+
+async fn request_json<T: DeserializeOwned>(
+    controller: &str,
+    method: Method,
+    path: PathAndQuery,
+) -> Result<T> {
+    let body = request_controller(controller, method, path).await?;
+    serde_json::from_slice(&body).context("invalid Agent data from Controller")
+}
+
+async fn request_controller(controller: &str, method: Method, path: PathAndQuery) -> Result<Bytes> {
     let mut parts = parse_controller_url(controller)?.into_parts();
-    parts.path_and_query = Some(http::uri::PathAndQuery::from_static(AGENTS_PATH));
+    parts.path_and_query = Some(path);
     let uri = Uri::from_parts(parts)?;
-    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<bytes::Bytes>>();
-    let body = tokio::time::timeout(Duration::from_secs(5), async {
-        let response = client.get(uri).await.context("HTTP request failed")?;
-        ensure!(
-            response.status().is_success(),
-            "Controller returned HTTP {}",
-            response.status()
-        );
-        response
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Empty::new())?;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let response = client
+            .request(request)
+            .await
+            .context("HTTP request failed")?;
+        let status = response.status();
+        let body = response
             .into_body()
             .collect()
             .await
-            .context("read Controller response")
+            .context("read Controller response")?
+            .to_bytes();
+        if !status.is_success() {
+            if let Ok(ErrorBody { error }) = serde_json::from_slice(&body) {
+                bail!("Controller returned HTTP {status}: {error}");
+            }
+            bail!("Controller returned HTTP {status}");
+        }
+        Ok(body)
     })
     .await
-    .context("Controller request timed out")??
-    .to_bytes();
-    serde_json::from_slice(&body).context("invalid Agent list from Controller")
+    .context("Controller request timed out")?
 }
 
 fn write_list(writer: &mut impl Write, agents: &[AgentRecord], output: Output) -> Result<()> {
     let rows: Vec<_> = agents.iter().map(AgentListRow::from).collect();
     match output {
         Output::Table => write_table(writer, &rows),
-        Output::Json => {
-            serde_json::to_writer_pretty(&mut *writer, &rows)?;
-            writeln!(writer)?;
+        Output::Json => write_json(writer, &rows),
+    }
+}
+
+fn write_detail(writer: &mut impl Write, detail: &AgentDetail, output: Output) -> Result<()> {
+    let row = AgentDetailRow {
+        agent: AgentListRow::from(&detail.record),
+        lease_expires_at: detail.lease_expires_at.timestamp(),
+    };
+    match output {
+        Output::Table => {
+            write_table(writer, &[row.agent])?;
+            writeln!(writer, "Lease expires at (UTC)  {}", row.lease_expires_at)?;
             Ok(())
         }
+        Output::Json => write_json(writer, &row),
     }
+}
+
+fn write_removal(writer: &mut impl Write, agent_id: &str, output: Output) -> Result<()> {
+    match output {
+        Output::Table => {
+            writeln!(writer, "Agent ID  {}", escape_control(agent_id))?;
+            writeln!(writer, "Result    Removed")?;
+            Ok(())
+        }
+        Output::Json => write_json(
+            writer,
+            &serde_json::json!({ "agent_id": agent_id, "removed": true }),
+        ),
+    }
+}
+
+fn write_json(writer: &mut impl Write, records: &impl Serialize) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *writer, records)?;
+    writeln!(writer)?;
+    Ok(())
 }
 
 fn write_table(writer: &mut impl Write, agents: &[AgentListRow<'_>]) -> Result<()> {

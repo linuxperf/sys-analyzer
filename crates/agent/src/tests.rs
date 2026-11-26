@@ -47,11 +47,24 @@ impl Controller for ScriptedController {
             .expect("unexpected registration")
     }
 
-    async fn heartbeat(&mut self, agent_id: &str) -> Result<Heartbeat, RpcError> {
+    async fn heartbeat(
+        &mut self,
+        agent_id: &str,
+        _session_id: &str,
+    ) -> Result<Heartbeat, RpcError> {
         assert_eq!(agent_id, "test-agent");
         self.requests
             .push((self.start.elapsed().as_millis(), Request::Heartbeat));
         self.heartbeats.pop_front().expect("unexpected heartbeat")
+    }
+
+    async fn deregister(
+        &mut self,
+        _agent_id: &str,
+        _session_id: &str,
+        _reason: &str,
+    ) -> Result<(), RpcError> {
+        panic!("unexpected deregistration")
     }
 }
 
@@ -88,9 +101,14 @@ async fn retries_registration_and_heartbeats_then_uses_the_new_session_interval(
         ],
     );
 
-    let error = maintain_registration(&mut controller, "controller", &agent())
-        .await
-        .unwrap_err();
+    let error = maintain_registration(
+        &mut controller,
+        "controller",
+        &agent(),
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
 
     assert_eq!(error.to_string(), "terminal heartbeat error");
     let [
@@ -114,9 +132,14 @@ async fn fatal_registration_error_stops_before_heartbeat() {
     let mut controller =
         ScriptedController::new([Err(RpcError::Fatal(anyhow!("registration rejected")))], []);
 
-    let error = maintain_registration(&mut controller, "controller", &agent())
-        .await
-        .unwrap_err();
+    let error = maintain_registration(
+        &mut controller,
+        "controller",
+        &agent(),
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
 
     assert_eq!(error.to_string(), "registration rejected");
     assert!(matches!(
@@ -135,9 +158,14 @@ async fn zero_heartbeat_interval_stops_before_heartbeat() {
         [],
     );
 
-    let error = maintain_registration(&mut controller, "controller", &agent())
-        .await
-        .unwrap_err();
+    let error = maintain_registration(
+        &mut controller,
+        "controller",
+        &agent(),
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
 
     assert_eq!(
         error.to_string(),
