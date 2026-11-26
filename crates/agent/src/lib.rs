@@ -1,153 +1,115 @@
-use std::{collections::BTreeMap, error::Error, io, iter, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
-use anyhow::{Context, Result, bail, ensure};
-use chrono::Utc;
-use sys_analyzer_shared::{
-    grpc::{
-        HeartbeatDirective, HeartbeatRequest, RegisterRequest, RegisterResponse,
-        agent_registration_client::AgentRegistrationClient,
-    },
-    parse_controller_url,
-};
+use anyhow::{Context, Result, ensure};
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
-use tonic::{
-    Code, Status,
-    transport::{Channel, Endpoint},
-};
 use uuid::Uuid;
+
+mod grpc;
+
+#[cfg(test)]
+mod tests;
 
 const CONTROLLER_RETRY_DELAY: Duration = Duration::from_secs(3);
 
-pub fn registration_request(
+struct Registration {
+    agent_id: String,
+    hostname: String,
+    pid: u32,
+    version: &'static str,
+    labels: Vec<String>,
+    metadata: BTreeMap<String, String>,
+}
+
+struct Session {
+    id: String,
+    heartbeat_interval: Duration,
+}
+
+enum Heartbeat {
+    Continue,
+    Reregister,
+}
+
+enum RpcError {
+    Retryable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+trait Controller {
+    async fn register(
+        &mut self,
+        agent: &Registration,
+        attempt_id: Uuid,
+    ) -> Result<Session, RpcError>;
+
+    async fn heartbeat(&mut self, agent_id: &str) -> Result<Heartbeat, RpcError>;
+}
+
+pub async fn run(
+    controller_addr: &str,
     agent_id: Option<String>,
     labels: Vec<String>,
     metadata: BTreeMap<String, String>,
-) -> RegisterRequest {
-    RegisterRequest {
+) -> Result<()> {
+    let agent = Registration {
         agent_id: agent_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         hostname: rustix::system::uname()
             .nodename()
             .to_string_lossy()
             .into_owned(),
         pid: std::process::id(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        version: env!("CARGO_PKG_VERSION"),
         labels,
         metadata,
-        registration_attempt_id: Uuid::new_v4().to_string(),
-    }
+    };
+    let mut controller = grpc::GrpcController::new(controller_addr)
+        .with_context(|| format!("register Agent {:?}", agent.agent_id))?;
+    maintain_registration(&mut controller, controller_addr, &agent).await
 }
 
-pub async fn register(controller: &str, request: RegisterRequest) -> Result<RegisterResponse> {
-    let channel = controller_endpoint(controller)?
-        .connect()
-        .await
-        .with_context(|| format!("connect to Controller at {controller}"))?;
-    let response = AgentRegistrationClient::new(channel)
-        .register(request)
-        .await?;
-    Ok(response.into_inner())
-}
+async fn maintain_registration(
+    controller: &mut impl Controller,
+    controller_addr: &str,
+    agent: &Registration,
+) -> Result<()> {
+    let agent_id = &agent.agent_id;
 
-fn controller_endpoint(controller: &str) -> Result<Endpoint> {
-    Ok(Endpoint::from(parse_controller_url(controller)?)
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(5)))
-}
-
-pub async fn run(controller: &str, mut request: RegisterRequest) -> Result<()> {
-    if request.registration_attempt_id.is_empty() {
-        request.registration_attempt_id = Uuid::new_v4().to_string();
-    }
-    let agent_id = request.agent_id.clone();
-    let endpoint =
-        controller_endpoint(controller).with_context(|| format!("register Agent {agent_id:?}"))?;
-    let mut client = AgentRegistrationClient::new(endpoint.connect_lazy());
     loop {
+        // Retries of this registration can replay a committed Controller response.
+        let attempt_id = Uuid::new_v4();
         let session = loop {
-            match client.register(request.clone()).await {
-                Ok(response) => break response.into_inner(),
-                Err(error) if is_retryable_rpc_error(&error) => {
+            match controller.register(agent, attempt_id).await {
+                Ok(session) => break session,
+                Err(RpcError::Retryable(error)) => {
                     eprintln!(
-                        "Registration for Agent {agent_id:?} at {controller} failed and will retry ({error})"
+                        "Registration for Agent {agent_id:?} at {controller_addr} failed and will retry ({error})"
                     );
                     sleep(CONTROLLER_RETRY_DELAY).await;
                 }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("register Agent {agent_id:?}"));
-                }
+                Err(RpcError::Fatal(error)) => return Err(error),
             }
         };
+
+        let period = session.heartbeat_interval;
         ensure!(
-            session.heartbeat_interval_ms > 0,
+            !period.is_zero(),
             "Controller returned a zero heartbeat interval"
         );
-        println!(
-            "Agent {agent_id:?} registered with session {}",
-            session.session_id
-        );
-        let period = Duration::from_millis(session.heartbeat_interval_ms);
-        heartbeat_until_reregister(&mut client, &agent_id, period).await?;
-        request.registration_attempt_id = Uuid::new_v4().to_string();
-    }
-}
+        println!("Agent {agent_id:?} registered with session {}", session.id);
 
-async fn heartbeat_until_reregister(
-    client: &mut AgentRegistrationClient<Channel>,
-    agent_id: &str,
-    period: Duration,
-) -> Result<()> {
-    let mut ticks = interval_at(Instant::now() + period, period);
-    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    loop {
-        ticks.tick().await;
-        let response = client
-            .heartbeat(HeartbeatRequest {
-                agent_id: agent_id.to_owned(),
-                sent_at_unix_ms: Utc::now().timestamp_millis(),
-            })
-            .await;
-        let response = match response {
-            Ok(response) => response.into_inner(),
-            // Older Controllers signal a missing registration with NotFound.
-            Err(error) if error.code() == Code::NotFound => return Ok(()),
-            Err(error) if is_retryable_rpc_error(&error) => {
-                eprintln!("Heartbeat for Agent {agent_id:?} failed and will retry ({error})");
-                ticks.reset_after(CONTROLLER_RETRY_DELAY);
-                continue;
+        let mut ticks = interval_at(Instant::now() + period, period);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            match controller.heartbeat(agent_id).await {
+                Ok(Heartbeat::Continue) => {}
+                Ok(Heartbeat::Reregister) => break,
+                Err(RpcError::Retryable(error)) => {
+                    eprintln!("Heartbeat for Agent {agent_id:?} failed and will retry ({error})");
+                    ticks.reset_after(CONTROLLER_RETRY_DELAY);
+                }
+                Err(RpcError::Fatal(error)) => return Err(error),
             }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("send heartbeat for Agent {agent_id:?}"));
-            }
-        };
-        match HeartbeatDirective::try_from(response.directive) {
-            Ok(HeartbeatDirective::Continue) => {}
-            Ok(HeartbeatDirective::Reregister) => return Ok(()),
-            _ => bail!(
-                "Controller returned unexpected heartbeat directive {} for Agent {agent_id:?}",
-                response.directive
-            ),
         }
     }
-}
-
-fn is_retryable_rpc_error(status: &Status) -> bool {
-    // Tonic reports a local RPC timeout as Cancelled.
-    matches!(
-        status.code(),
-        Code::Cancelled | Code::DeadlineExceeded | Code::Unavailable
-    ) || iter::successors(status.source(), |&source| source.source()).any(|source| {
-        // Tonic can report local socket failures as Unknown or Internal.
-        source.downcast_ref::<io::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::NotConnected
-                    | io::ErrorKind::UnexpectedEof
-            )
-        })
-    })
 }
