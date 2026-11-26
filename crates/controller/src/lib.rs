@@ -219,9 +219,10 @@ impl AgentRegistration for GrpcRegistry {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        let request = request.into_inner();
         let heartbeat = self
             .0
-            .heartbeat(&request.into_inner().agent_id)
+            .heartbeat(&request.agent_id, request.session_id.as_deref())
             .map_err(registry_status)?;
         let response = match heartbeat {
             Heartbeat::Renewed { lease_expires_at } => HeartbeatResponse {

@@ -47,7 +47,11 @@ impl Controller for ScriptedController {
             .expect("unexpected registration")
     }
 
-    async fn heartbeat(&mut self, agent_id: &str) -> Result<Heartbeat, RpcError> {
+    async fn heartbeat(
+        &mut self,
+        agent_id: &str,
+        _session_id: &str,
+    ) -> Result<Heartbeat, RpcError> {
         assert_eq!(agent_id, "test-agent");
         self.requests
             .push((self.start.elapsed().as_millis(), Request::Heartbeat));
@@ -59,7 +63,7 @@ impl Controller for ScriptedController {
         _agent_id: &str,
         _session_id: &str,
         _reason: &str,
-    ) -> Result<()> {
+    ) -> Result<(), RpcError> {
         panic!("unexpected deregistration")
     }
 }

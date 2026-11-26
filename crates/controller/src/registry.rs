@@ -103,9 +103,19 @@ impl RegisteredAgent {
         self.record.status == AgentStatus::Online && now < self.lease_expires_at
     }
 
-    fn detail(&self) -> AgentDetail {
+    fn effective_status(&self, now: DateTime<Utc>) -> AgentStatus {
+        match self.record.status {
+            AgentStatus::Online if !self.has_active_lease(now) => AgentStatus::Offline,
+            status => status,
+        }
+    }
+
+    fn detail(&self, status: AgentStatus) -> AgentDetail {
         AgentDetail {
-            record: self.record.clone(),
+            record: AgentRecord {
+                status,
+                ..self.record.clone()
+            },
             lease_expires_at: self.lease_expires_at,
         }
     }
@@ -183,7 +193,11 @@ impl Registry {
         })
     }
 
-    pub(super) fn heartbeat(&self, agent_id: &str) -> Result<Heartbeat, RegistryError> {
+    pub(super) fn heartbeat(
+        &self,
+        agent_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Heartbeat, RegistryError> {
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
         let Some(agent) = agents.get_mut(agent_id) else {
             return Ok(Heartbeat::Reregister);
@@ -192,9 +206,12 @@ impl Registry {
             return Ok(Heartbeat::Stop);
         }
 
+        let matches_session = session_id.is_none_or(|session_id| {
+            Uuid::parse_str(session_id).is_ok_and(|id| agent.session_id == Some(id))
+        });
         // Read Controller time while holding the lock so renewal follows mutation order.
         let received_at = (self.clock)();
-        if !agent.has_active_lease(received_at) {
+        if !matches_session || !agent.has_active_lease(received_at) {
             return Ok(Heartbeat::Reregister);
         }
         let lease_expires_at = self.heartbeat.lease_expires_at(received_at)?;
@@ -239,16 +256,25 @@ impl Registry {
 
     pub(super) fn snapshot(&self, status: Option<AgentStatus>) -> Vec<AgentRecord> {
         let agents = self.agents.lock().expect("Agent registry lock poisoned");
+        let now = (self.clock)();
         agents
             .values()
-            .filter(|agent| status.is_none_or(|status| agent.record.status == status))
-            .map(|agent| agent.record.clone())
+            .filter_map(|agent| {
+                let effective_status = agent.effective_status(now);
+                status
+                    .is_none_or(|status| status == effective_status)
+                    .then(|| AgentRecord {
+                        status: effective_status,
+                        ..agent.record.clone()
+                    })
+            })
             .collect()
     }
 
     pub(super) fn detail(&self, agent_id: &str) -> Option<AgentDetail> {
         let agents = self.agents.lock().expect("Agent registry lock poisoned");
-        agents.get(agent_id).map(RegisteredAgent::detail)
+        let agent = agents.get(agent_id)?;
+        Some(agent.detail(agent.effective_status((self.clock)())))
     }
 
     pub(super) fn manage(
@@ -274,7 +300,7 @@ impl Registry {
             }
             (ManagementAction::Enable, _) => return Err(ManagementError::NotDisabled),
         }
-        Ok(agent.detail())
+        Ok(agent.detail(agent.record.status))
     }
 
     pub(super) fn remove(&self, agent_id: &str) -> Result<(), ManagementError> {
@@ -318,7 +344,7 @@ mod tests {
         let (registry, now) = registry(start);
         let original_session = registry.register(registration("first-attempt")).unwrap();
         *now.lock().unwrap() = start + TimeDelta::milliseconds(25);
-        registry.heartbeat("test-agent").unwrap();
+        registry.heartbeat("test-agent", None).unwrap();
         let original_snapshot = registry.snapshot(None);
 
         *now.lock().unwrap() = start + TimeDelta::milliseconds(500);
@@ -342,11 +368,11 @@ mod tests {
         *now.lock().unwrap() = received_at;
         let before = registry.snapshot(None);
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].status, AgentStatus::Online);
+        assert_eq!(before[0].status, AgentStatus::Offline);
         assert_eq!(before[0].registered_at, start);
         assert_eq!(before[0].last_heartbeat_at, None);
         assert_eq!(
-            registry.heartbeat("test-agent").unwrap(),
+            registry.heartbeat("test-agent", None).unwrap(),
             Heartbeat::Reregister
         );
         assert_eq!(registry.snapshot(None), before);
@@ -366,13 +392,13 @@ mod tests {
         registry.register(registration("second-attempt")).unwrap();
         let first_heartbeat_at = start + TimeDelta::milliseconds(25);
         *now.lock().unwrap() = first_heartbeat_at;
-        registry.heartbeat("test-agent").unwrap();
+        registry.heartbeat("test-agent", None).unwrap();
         let before = registry.snapshot(None);
         assert_eq!(before[0].last_heartbeat_at, Some(first_heartbeat_at));
 
         *now.lock().unwrap() = DateTime::<Utc>::MAX_UTC - TimeDelta::milliseconds(500);
         assert_eq!(
-            registry.heartbeat("test-agent"),
+            registry.heartbeat("test-agent", None),
             Err(RegistryError::LeaseExpirationOutOfRange)
         );
         assert_eq!(registry.snapshot(None), before);
@@ -383,7 +409,7 @@ mod tests {
         let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let (registry, _) = registry(start);
         assert_eq!(
-            registry.heartbeat("unknown-agent"),
+            registry.heartbeat("unknown-agent", None),
             Ok(Heartbeat::Reregister)
         );
         assert!(registry.snapshot(None).is_empty());

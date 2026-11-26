@@ -72,6 +72,33 @@ class ControlPlaneTests(unittest.TestCase):
         recovered = self.wait_for_agent_status(rest_addr, agent_id, "Online")
         self.assertEqual(recovered["pid"], agent.pid)
 
+    def test_stalled_agent_cannot_renew_a_replacement_agents_lease(self):
+        rest_addr, grpc_addr = self.start_controller(
+            "--heartbeat-interval-ms", "40", "--lease-timeout-ms", "1000",
+            "--offline-retention-ms", "30000", "--sweep-interval-ms", "20",
+        )
+        first, first_log = self.start_agent(grpc_addr, "--agent-id", "reused-agent")
+        agent_id, first_session = self.wait_for_registration(first, first_log)
+
+        first.send_signal(signal.SIGSTOP)
+        try:
+            self.wait_for_agent_status(rest_addr, agent_id, "Offline")
+            replacement, log = self.start_agent(grpc_addr, "--agent-id", agent_id)
+            _, replacement_session = self.wait_for_registration(replacement, log)
+        finally:
+            first.send_signal(signal.SIGCONT)
+
+        self.assertNotEqual(replacement_session, first_session)
+        self.assertNotEqual(first.wait(timeout=TIMEOUT), 0)
+        self.assertIn("already online", first_log.read_text(encoding="utf-8"))
+        online = self.wait_for_heartbeat(rest_addr, int(time.time()) - 1)
+        self.assertEqual(online["pid"], replacement.pid)
+
+        replacement.kill()
+        replacement.wait(timeout=TIMEOUT)
+        offline = self.wait_for_agent_status(rest_addr, agent_id, "Offline")
+        self.assertEqual(offline["pid"], replacement.pid)
+
     def test_controller_shuts_down_cleanly_on_sigint_and_sigterm(self):
         for stop_signal in (signal.SIGINT, signal.SIGTERM):
             with self.subTest(stop_signal=stop_signal.name):
@@ -168,6 +195,37 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(online["pid"], replacement.pid)
         self.assertEqual(online["labels"], ["new"])
         self.assertEqual(online["metadata"], {"zone": "new"})
+
+    def test_rest_reports_expired_leases_as_offline_before_the_next_sweep(self):
+        rest_addr, grpc_addr = self.start_controller(
+            "--heartbeat-interval-ms", "100", "--lease-timeout-ms", "1000",
+            "--offline-retention-ms", "100", "--sweep-interval-ms", "60000",
+        )
+        agent, log = self.start_agent(grpc_addr, "--agent-id", "expired-agent")
+        agent_id, _ = self.wait_for_registration(agent, log)
+        agent.kill()
+        agent.wait(timeout=TIMEOUT)
+
+        connection = http.client.HTTPConnection(rest_addr, timeout=TIMEOUT)
+        self.addCleanup(connection.close)
+
+        def get_json(path):
+            connection.request("GET", path)
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            return json.load(response)
+
+        detail_path = f"/agents/{agent_id}"
+        previous_detail = get_json(detail_path)
+        expiry = datetime.fromisoformat(previous_detail["lease_expires_at"]).timestamp()
+        time.sleep(max(0, expiry - time.time()) + 0.15)
+
+        self.assertEqual(get_json(detail_path), {**previous_detail, "status": "Offline"})
+        row, = get_json("/agents")
+        self.assertEqual(row["status"], "Offline")
+        self.assertEqual(row["agent_id"], agent_id)
+        self.assertEqual(get_json("/agents?status=Offline"), [row])
+        self.assertEqual(get_json("/agents?status=Online"), [])
 
     def wait_for_agent_status(self, rest_addr, agent_id, status):
         deadline = time.monotonic() + TIMEOUT
@@ -296,6 +354,35 @@ class ControlPlaneTests(unittest.TestCase):
                 agents = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
                 self.assertNotIn(agent_id, {entry["agent_id"] for entry in agents})
 
+    def test_agent_retries_deregistration_if_the_connection_resets_before_delivery(self):
+        rest_addr, grpc_addr = self.start_controller(
+            "--heartbeat-interval-ms", "30000", "--lease-timeout-ms", "60000",
+        )
+        # The second RPC on the connection is Deregister.
+        proxy_addr, _ = self.start_grpc_fault_proxy(grpc_addr, 3, reset=True, intercept_request=True)
+        agent, log = self.start_agent(proxy_addr, "--agent-id", "departing-agent")
+        agent_id, _ = self.wait_for_registration(agent, log)
+        self.wait_for_agent_status(rest_addr, agent_id, "Online")
+
+        agent.send_signal(signal.SIGTERM)
+
+        self.assertEqual(agent.wait(timeout=TIMEOUT), 0, log.read_text())
+        self.assertEqual(json.loads(self.cli(rest_addr, "list", "--output", "json").stdout), [])
+
+    def test_agent_shutdown_is_bounded_when_deregistration_gets_no_reply(self):
+        rest_addr, grpc_addr = self.start_controller(
+            "--heartbeat-interval-ms", "30000", "--lease-timeout-ms", "60000",
+        )
+        proxy_addr, _ = self.start_grpc_fault_proxy(grpc_addr, 3, hold=True, intercept_request=True)
+        agent, log = self.start_agent(proxy_addr, "--agent-id", "departing-agent")
+        agent_id, _ = self.wait_for_registration(agent, log)
+
+        agent.send_signal(signal.SIGTERM)
+
+        self.assertEqual(agent.wait(timeout=4), 0, log.read_text())
+        self.assertIn("shutdown cleanup timed out", log.read_text())
+        self.assertEqual(self.wait_for_agent_status(rest_addr, agent_id, "Online")["pid"], agent.pid)
+
     def test_disabling_an_online_agent_stops_it_and_rejects_its_id(self):
         rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
         agent_id = "rack/节点?worker=%"
@@ -319,7 +406,7 @@ class ControlPlaneTests(unittest.TestCase):
         for enable_before_deregister in (False, True):
             with self.subTest(enable_before_deregister=enable_before_deregister):
                 rest_addr, grpc_addr = self.start_controller("--lease-timeout-ms", "60000")
-                proxy_addr, release_reply = self.start_grpc_reply_proxy(grpc_addr, 1, hold=True)
+                proxy_addr, release_reply = self.start_grpc_fault_proxy(grpc_addr, 1, hold=True)
                 agent_id = "returning-agent"
                 agent, log = self.start_agent(proxy_addr, "--agent-id", agent_id)
                 self.wait_for_agent_status(rest_addr, agent_id, "Online")
@@ -352,7 +439,7 @@ class ControlPlaneTests(unittest.TestCase):
 
     def test_removing_a_running_agent_deletes_its_record_and_it_can_register_again(self):
         rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
-        proxy_addr, release_reply = self.start_grpc_reply_proxy(grpc_addr, 1, hold=True)
+        proxy_addr, release_reply = self.start_grpc_fault_proxy(grpc_addr, 1, hold=True)
         agent_id = "."
         agent, log = self.start_agent(proxy_addr, "--agent-id", agent_id)
         self.wait_for_agent_status(rest_addr, agent_id, "Online")
@@ -439,7 +526,7 @@ class ControlPlaneTests(unittest.TestCase):
 
     def test_agent_shutdown_deregisters_even_when_the_registration_reply_is_lost(self):
         rest_addr, grpc_addr = self.start_controller("--lease-timeout-ms", "60000")
-        proxy_addr, release_reply = self.start_grpc_reply_proxy(
+        proxy_addr, release_reply = self.start_grpc_fault_proxy(
             grpc_addr, 1, reset=True, hold=True,
         )
         agent, log = self.start_agent(proxy_addr, "--agent-id", "departing-agent")
@@ -464,7 +551,7 @@ class ControlPlaneTests(unittest.TestCase):
         for stream_id, call in ((1, "Registration"), (3, "Heartbeat")):
             with self.subTest(call=call):
                 rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
-                proxy_addr, _ = self.start_grpc_reply_proxy(grpc_addr, stream_id, reset=True)
+                proxy_addr, _ = self.start_grpc_fault_proxy(grpc_addr, stream_id, reset=True)
                 agent, log = self.start_agent(proxy_addr, "--agent-id", "reset-agent")
                 self.wait_for_output(agent, log, rf'^{call} for Agent "reset-agent" .*will retry')
                 resumed_at = int(time.time())
@@ -475,7 +562,7 @@ class ControlPlaneTests(unittest.TestCase):
 
     def test_agent_replays_registration_after_its_committed_reply_times_out(self):
         rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
-        proxy_addr, release_reply = self.start_grpc_reply_proxy(grpc_addr, 1)
+        proxy_addr, release_reply = self.start_grpc_fault_proxy(grpc_addr, 1)
         agent, log = self.start_agent(proxy_addr, "--agent-id", "replay-agent")
         try:
             self.wait_for_output(agent, log, r'^Registration for Agent "replay-agent" .*will retry')
@@ -596,11 +683,12 @@ class ControlPlaneTests(unittest.TestCase):
             time.sleep(0.025)
         self.fail("Agent did not report a new heartbeat")
 
-    def start_grpc_reply_proxy(self, grpc_addr, stream_id, *, reset=False, hold=False):
+    def start_grpc_fault_proxy(self, grpc_addr, stream_id, *, reset=False, hold=False,
+                               intercept_request=False):
         upstream_host, upstream_port = grpc_addr.split(":")
         upstream_addr = (upstream_host, int(upstream_port))
         fault_injected = threading.Event()
-        release_reply = threading.Event()
+        release_frame = threading.Event()
 
         class Relay(socketserver.BaseRequestHandler):
             def handle(self):
@@ -612,44 +700,51 @@ class ControlPlaneTests(unittest.TestCase):
                     pass
 
             def relay(self, downstream, upstream):
+                fault_source = downstream if intercept_request else upstream
+                # The client sends 24 bytes before the first HTTP/2 frame.
+                preface_length = 24 if intercept_request else 0
                 pending = bytearray()
                 while readable := select.select([downstream, upstream], [], [], TIMEOUT)[0]:
-                    if downstream in readable:
-                        data = downstream.recv(65536)
+                    for source in readable:
+                        target = upstream if source is downstream else downstream
+                        data = source.recv(65536)
                         if not data:
                             return
-                        upstream.sendall(data)
-                    if upstream not in readable:
-                        continue
-                    data = upstream.recv(65536)
-                    if not data:
-                        return
-                    pending.extend(data)
-                    # The HTTP/2 frame header gives the length and stream ID.
-                    while len(pending) >= 9:
-                        frame_end = 9 + int.from_bytes(pending[0:3], "big")
-                        if len(pending) < frame_end:
-                            break
-                        reply_stream = int.from_bytes(pending[5:9], "big") & 0x7fffffff
-                        if pending[3] == 0x01 and reply_stream == stream_id and not fault_injected.is_set():
-                            fault_injected.set()
-                            if (not reset or hold) and not release_reply.wait(TIMEOUT):
-                                return
-                            if reset:
-                                downstream.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-                                downstream.close()
-                                return
-                        downstream.sendall(pending[:frame_end])
-                        del pending[:frame_end]
+                        if source is not fault_source:
+                            target.sendall(data)
+                            continue
+                        pending.extend(data)
+                        if preface_length:
+                            if len(pending) < preface_length:
+                                continue
+                            target.sendall(pending[:preface_length])
+                            del pending[:preface_length]
+                            preface_length = 0
+                        # The HTTP/2 frame header gives the length and stream ID.
+                        while len(pending) >= 9:
+                            frame_end = 9 + int.from_bytes(pending[0:3], "big")
+                            if len(pending) < frame_end:
+                                break
+                            frame_stream = int.from_bytes(pending[5:9], "big") & 0x7fffffff
+                            if pending[3] == 0x01 and frame_stream == stream_id and not fault_injected.is_set():
+                                fault_injected.set()
+                                if (not reset or hold) and not release_frame.wait(TIMEOUT):
+                                    return
+                                if reset:
+                                    downstream.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                                    downstream.close()
+                                    return
+                            target.sendall(pending[:frame_end])
+                            del pending[:frame_end]
 
         proxy = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Relay)
         proxy.daemon_threads = True
         threading.Thread(target=proxy.serve_forever, daemon=True).start()
         self.addCleanup(proxy.server_close)
         self.addCleanup(proxy.shutdown)
-        self.addCleanup(release_reply.set)
+        self.addCleanup(release_frame.set)
         host, port = proxy.server_address
-        return f"{host}:{port}", release_reply
+        return f"{host}:{port}", release_frame
 
     def table_heartbeats(self, rest_addr):
         header, *table_rows = self.cli(rest_addr, "list").stdout.splitlines()

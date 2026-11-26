@@ -14,6 +14,7 @@ mod tests;
 
 const CONTROLLER_RETRY_DELAY: Duration = Duration::from_secs(3);
 const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const DEREGISTER_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 struct Registration {
     agent_id: String,
@@ -47,9 +48,14 @@ trait Controller {
         attempt_id: Uuid,
     ) -> Result<Session, RpcError>;
 
-    async fn heartbeat(&mut self, agent_id: &str) -> Result<Heartbeat, RpcError>;
+    async fn heartbeat(&mut self, agent_id: &str, session_id: &str) -> Result<Heartbeat, RpcError>;
 
-    async fn deregister(&mut self, agent_id: &str, session_id: &str, reason: &str) -> Result<()>;
+    async fn deregister(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<(), RpcError>;
 }
 
 pub async fn run(
@@ -112,7 +118,7 @@ async fn maintain_registration(
                                         RpcError::Retryable(error) | RpcError::Fatal(error) => error,
                                     },
                                 )?;
-                                controller.deregister(agent_id, &session.id, reason).await
+                                deregister_with_retry(controller, agent_id, &session.id, reason).await
                             }).await;
                             return Ok(());
                         }
@@ -136,13 +142,15 @@ async fn maintain_registration(
             let heartbeat = tokio::select! {
                 biased;
                 reason = &mut shutdown => {
-                    finish_shutdown(agent_id, controller.deregister(agent_id, &session.id, reason))
-                        .await;
+                    finish_shutdown(
+                        agent_id,
+                        deregister_with_retry(controller, agent_id, &session.id, reason),
+                    ).await;
                     return Ok(());
                 }
                 result = async {
                     ticks.tick().await;
-                    controller.heartbeat(agent_id).await
+                    controller.heartbeat(agent_id, &session.id).await
                 } => result,
             };
             match heartbeat {
@@ -158,6 +166,21 @@ async fn maintain_registration(
                 }
                 Err(RpcError::Fatal(error)) => return Err(error),
             }
+        }
+    }
+}
+
+async fn deregister_with_retry(
+    controller: &mut impl Controller,
+    agent_id: &str,
+    session_id: &str,
+    reason: &str,
+) -> Result<()> {
+    loop {
+        match controller.deregister(agent_id, session_id, reason).await {
+            Ok(()) => return Ok(()),
+            Err(RpcError::Retryable(_)) => sleep(DEREGISTER_RETRY_DELAY).await,
+            Err(RpcError::Fatal(error)) => return Err(error),
         }
     }
 }

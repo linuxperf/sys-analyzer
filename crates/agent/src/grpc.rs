@@ -61,19 +61,25 @@ impl Controller for GrpcController {
         })
     }
 
-    async fn heartbeat(&mut self, agent_id: &str) -> Result<Heartbeat, RpcError> {
+    async fn heartbeat(&mut self, agent_id: &str, session_id: &str) -> Result<Heartbeat, RpcError> {
         let response = self
             .client
             .heartbeat(HeartbeatRequest {
                 agent_id: agent_id.to_owned(),
                 sent_at_unix_ms: Utc::now().timestamp_millis(),
+                session_id: Some(session_id.to_owned()),
             })
             .await;
 
         heartbeat_outcome(agent_id, response)
     }
 
-    async fn deregister(&mut self, agent_id: &str, session_id: &str, reason: &str) -> Result<()> {
+    async fn deregister(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<(), RpcError> {
         match self
             .client
             .deregister(DeregisterRequest {
@@ -85,7 +91,9 @@ impl Controller for GrpcController {
         {
             Ok(_) => Ok(()),
             Err(status) if status.code() == Code::NotFound => Ok(()),
-            Err(status) => Err(status.into()),
+            Err(status) => Err(classify_error(status, || {
+                format!("deregister Agent {agent_id:?}")
+            })),
         }
     }
 }
