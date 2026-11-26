@@ -84,38 +84,166 @@ pub(super) enum ManagementAction {
     Enable,
 }
 
+#[derive(Debug)]
 pub(super) enum ManagementError {
     Missing,
     AlreadyDisabled,
     NotDisabled,
 }
 
+enum RecordState {
+    Registered {
+        session_id: Uuid,
+    },
+    Offline {
+        since: DateTime<Utc>,
+        session_id: Option<Uuid>,
+    },
+    Disabled,
+}
+
 struct RegisteredAgent {
-    record: AgentRecord,
-    session_id: Option<Uuid>,
-    registration_attempt_id: String,
+    registration: Registration,
+    registered_at: DateTime<Utc>,
+    last_heartbeat_at: Option<DateTime<Utc>>,
     lease_expires_at: DateTime<Utc>,
-    offline_since: Option<DateTime<Utc>>,
+    state: RecordState,
 }
 
 impl RegisteredAgent {
-    fn has_active_lease(&self, now: DateTime<Utc>) -> bool {
-        self.record.status == AgentStatus::Online && now < self.lease_expires_at
-    }
-
-    fn effective_status(&self, now: DateTime<Utc>) -> AgentStatus {
-        match self.record.status {
-            AgentStatus::Online if !self.has_active_lease(now) => AgentStatus::Offline,
-            status => status,
+    fn new(
+        registration: Registration,
+        session_id: Uuid,
+        registered_at: DateTime<Utc>,
+        lease_expires_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            registration,
+            registered_at,
+            last_heartbeat_at: None,
+            lease_expires_at,
+            state: RecordState::Registered { session_id },
         }
     }
 
-    fn detail(&self, status: AgentStatus) -> AgentDetail {
-        AgentDetail {
-            record: AgentRecord {
-                status,
-                ..self.record.clone()
+    fn active_session(&self, now: DateTime<Utc>) -> Option<Uuid> {
+        match self.state {
+            RecordState::Registered { session_id } if now < self.lease_expires_at => {
+                Some(session_id)
+            }
+            _ => None,
+        }
+    }
+
+    fn matches_deregistration(&self, id: Uuid) -> bool {
+        match self.state {
+            RecordState::Registered { session_id } => session_id == id,
+            RecordState::Offline { session_id, .. } => session_id == Some(id),
+            RecordState::Disabled => false,
+        }
+    }
+
+    fn replay(&self, attempt_id: &str, now: DateTime<Utc>) -> Result<Option<Uuid>, RegistryError> {
+        if matches!(self.state, RecordState::Disabled) {
+            return Err(RegistryError::AgentDisabled(
+                self.registration.agent_id.clone(),
+            ));
+        }
+        let Some(session_id) = self.active_session(now) else {
+            return Ok(None);
+        };
+        if attempt_id.is_empty() || attempt_id != self.registration.attempt_id {
+            return Err(RegistryError::AlreadyRegistered(
+                self.registration.agent_id.clone(),
+            ));
+        }
+        Ok(Some(session_id))
+    }
+
+    fn heartbeat(
+        &mut self,
+        session_id: Option<&str>,
+        received_at: DateTime<Utc>,
+        heartbeat: HeartbeatSettings,
+    ) -> Result<Heartbeat, RegistryError> {
+        if matches!(self.state, RecordState::Disabled) {
+            return Ok(Heartbeat::Stop);
+        }
+        let Some(active_id) = self.active_session(received_at) else {
+            return Ok(Heartbeat::Reregister);
+        };
+        // Older Agents omit the session ID and can renew by Agent ID alone.
+        if session_id.is_some_and(|id| Uuid::parse_str(id).ok() != Some(active_id)) {
+            return Ok(Heartbeat::Reregister);
+        }
+        let lease_expires_at = heartbeat.lease_expires_at(received_at)?;
+        self.last_heartbeat_at = Some(received_at);
+        self.lease_expires_at = lease_expires_at;
+        Ok(Heartbeat::Renewed { lease_expires_at })
+    }
+
+    fn retain(&mut self, now: DateTime<Utc>, offline_retention: TimeDelta) -> bool {
+        match self.state {
+            RecordState::Registered { session_id } if self.active_session(now).is_none() => {
+                // Retention starts when a sweep first observes expiry. The original
+                // session can still explicitly deregister until revoked or replaced.
+                self.state = RecordState::Offline {
+                    since: now,
+                    session_id: Some(session_id),
+                };
+                true
+            }
+            RecordState::Offline { since, .. } => now - since < offline_retention,
+            RecordState::Registered { .. } | RecordState::Disabled => true,
+        }
+    }
+
+    fn manage(
+        &mut self,
+        action: ManagementAction,
+        now: DateTime<Utc>,
+    ) -> Result<AgentDetail, ManagementError> {
+        self.state = match (action, &self.state) {
+            (ManagementAction::Disable, RecordState::Disabled) => {
+                return Err(ManagementError::AlreadyDisabled);
+            }
+            (ManagementAction::Disable, _) => RecordState::Disabled,
+            (ManagementAction::Enable, RecordState::Disabled) => RecordState::Offline {
+                since: now,
+                session_id: None,
             },
+            (ManagementAction::Enable, _) => return Err(ManagementError::NotDisabled),
+        };
+        Ok(self.detail(now))
+    }
+
+    fn status(&self, now: DateTime<Utc>) -> AgentStatus {
+        match self.state {
+            RecordState::Registered { .. } if self.active_session(now).is_some() => {
+                AgentStatus::Online
+            }
+            RecordState::Registered { .. } | RecordState::Offline { .. } => AgentStatus::Offline,
+            RecordState::Disabled => AgentStatus::Disabled,
+        }
+    }
+
+    fn record(&self, status: AgentStatus) -> AgentRecord {
+        AgentRecord {
+            agent_id: self.registration.agent_id.clone(),
+            hostname: self.registration.hostname.clone(),
+            pid: self.registration.pid,
+            version: self.registration.version.clone(),
+            labels: self.registration.labels.clone(),
+            metadata: self.registration.metadata.clone(),
+            status,
+            registered_at: self.registered_at,
+            last_heartbeat_at: self.last_heartbeat_at,
+        }
+    }
+
+    fn detail(&self, now: DateTime<Utc>) -> AgentDetail {
+        AgentDetail {
+            record: self.record(self.status(now)),
             lease_expires_at: self.lease_expires_at,
         }
     }
@@ -124,17 +252,20 @@ impl RegisteredAgent {
 pub(super) struct Registry {
     agents: Mutex<BTreeMap<String, RegisteredAgent>>,
     heartbeat: HeartbeatSettings,
+    offline_retention: TimeDelta,
     clock: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 
 impl Registry {
     pub(super) fn new(
         heartbeat: HeartbeatSettings,
+        offline_retention: TimeDelta,
         clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static,
     ) -> Self {
         Self {
             agents: Mutex::default(),
             heartbeat,
+            offline_retention,
             clock: Box::new(clock),
         }
     }
@@ -149,41 +280,21 @@ impl Registry {
 
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
         let registered_at = (self.clock)();
-        let previous = agents.get(&request.agent_id);
-        if previous.is_some_and(|agent| agent.record.status == AgentStatus::Disabled) {
-            return Err(RegistryError::AgentDisabled(request.agent_id));
-        }
-        let online_agent = previous.filter(|agent| agent.has_active_lease(registered_at));
-        let session_id = if let Some(agent) = online_agent {
-            if request.attempt_id.is_empty() || request.attempt_id != agent.registration_attempt_id
-            {
-                return Err(RegistryError::AlreadyRegistered(request.agent_id));
+        let replayed_session = match agents.get(&request.agent_id) {
+            Some(agent) => agent.replay(&request.attempt_id, registered_at)?,
+            None => None,
+        };
+        let session_id = match replayed_session {
+            Some(id) => id,
+            None => {
+                let lease_expires_at = self.heartbeat.lease_expires_at(registered_at)?;
+                let id = Uuid::new_v4();
+                agents.insert(
+                    request.agent_id.clone(),
+                    RegisteredAgent::new(request, id, registered_at, lease_expires_at),
+                );
+                id
             }
-            agent.session_id.expect("online Agent has a session")
-        } else {
-            let lease_expires_at = self.heartbeat.lease_expires_at(registered_at)?;
-            let session_id = Uuid::new_v4();
-            agents.insert(
-                request.agent_id.clone(),
-                RegisteredAgent {
-                    record: AgentRecord {
-                        agent_id: request.agent_id,
-                        hostname: request.hostname,
-                        pid: request.pid,
-                        version: request.version,
-                        labels: request.labels,
-                        metadata: request.metadata,
-                        status: AgentStatus::Online,
-                        registered_at,
-                        last_heartbeat_at: None,
-                    },
-                    session_id: Some(session_id),
-                    registration_attempt_id: request.attempt_id,
-                    lease_expires_at,
-                    offline_since: None,
-                },
-            );
-            session_id
         };
 
         Ok(RegisteredSession {
@@ -202,40 +313,14 @@ impl Registry {
         let Some(agent) = agents.get_mut(agent_id) else {
             return Ok(Heartbeat::Reregister);
         };
-        if agent.record.status == AgentStatus::Disabled {
-            return Ok(Heartbeat::Stop);
-        }
-
-        let matches_session = session_id.is_none_or(|session_id| {
-            Uuid::parse_str(session_id).is_ok_and(|id| agent.session_id == Some(id))
-        });
-        // Read Controller time while holding the lock so renewal follows mutation order.
-        let received_at = (self.clock)();
-        if !matches_session || !agent.has_active_lease(received_at) {
-            return Ok(Heartbeat::Reregister);
-        }
-        let lease_expires_at = self.heartbeat.lease_expires_at(received_at)?;
-        agent.record.last_heartbeat_at = Some(received_at);
-        agent.lease_expires_at = lease_expires_at;
-        Ok(Heartbeat::Renewed { lease_expires_at })
+        // Read Controller time under the lock so renewal follows mutation order.
+        agent.heartbeat(session_id, (self.clock)(), self.heartbeat)
     }
 
-    pub(super) fn sweep(&self, offline_retention: TimeDelta) {
+    pub(super) fn sweep(&self) {
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
         let now = (self.clock)();
-        agents.retain(|_, agent| match agent.record.status {
-            AgentStatus::Online => {
-                if now >= agent.lease_expires_at {
-                    agent.record.status = AgentStatus::Offline;
-                    agent.offline_since = Some(now);
-                }
-                true
-            }
-            AgentStatus::Offline => agent
-                .offline_since
-                .is_none_or(|offline_since| now - offline_since < offline_retention),
-            AgentStatus::Disabled => true,
-        });
+        agents.retain(|_, agent| agent.retain(now, self.offline_retention));
     }
 
     pub(super) fn deregister(&self, agent_id: &str, session_id: &str) -> Result<(), RegistryError> {
@@ -246,7 +331,7 @@ impl Registry {
             Uuid::parse_str(session_id).map_err(|_| RegistryError::InvalidSessionId)?;
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
         match agents.entry(agent_id.to_owned()) {
-            Entry::Occupied(entry) if entry.get().session_id == Some(session_id) => {
+            Entry::Occupied(entry) if entry.get().matches_deregistration(session_id) => {
                 entry.remove();
                 Ok(())
             }
@@ -260,13 +345,10 @@ impl Registry {
         agents
             .values()
             .filter_map(|agent| {
-                let effective_status = agent.effective_status(now);
+                let effective_status = agent.status(now);
                 status
                     .is_none_or(|status| status == effective_status)
-                    .then(|| AgentRecord {
-                        status: effective_status,
-                        ..agent.record.clone()
-                    })
+                    .then(|| agent.record(effective_status))
             })
             .collect()
     }
@@ -274,7 +356,7 @@ impl Registry {
     pub(super) fn detail(&self, agent_id: &str) -> Option<AgentDetail> {
         let agents = self.agents.lock().expect("Agent registry lock poisoned");
         let agent = agents.get(agent_id)?;
-        Some(agent.detail(agent.effective_status((self.clock)())))
+        Some(agent.detail((self.clock)()))
     }
 
     pub(super) fn manage(
@@ -284,23 +366,7 @@ impl Registry {
     ) -> Result<AgentDetail, ManagementError> {
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
         let agent = agents.get_mut(agent_id).ok_or(ManagementError::Missing)?;
-        match (action, agent.record.status) {
-            (ManagementAction::Disable, AgentStatus::Disabled) => {
-                return Err(ManagementError::AlreadyDisabled);
-            }
-            (ManagementAction::Disable, _) => {
-                agent.record.status = AgentStatus::Disabled;
-                // Revoke the session so a delayed Deregister cannot discard the record.
-                agent.session_id = None;
-                agent.offline_since = None;
-            }
-            (ManagementAction::Enable, AgentStatus::Disabled) => {
-                agent.record.status = AgentStatus::Offline;
-                agent.offline_since = Some((self.clock)());
-            }
-            (ManagementAction::Enable, _) => return Err(ManagementError::NotDisabled),
-        }
-        Ok(agent.detail(agent.record.status))
+        agent.manage(action, (self.clock)())
     }
 
     pub(super) fn remove(&self, agent_id: &str) -> Result<(), ManagementError> {
@@ -319,11 +385,16 @@ mod tests {
 
     use super::*;
 
+    const RETENTION: TimeDelta = TimeDelta::seconds(2);
+
     fn registry(start: DateTime<Utc>) -> (Registry, Arc<Mutex<DateTime<Utc>>>) {
         let now = Arc::new(Mutex::new(start));
         let clock = Arc::clone(&now);
         let settings = HeartbeatSettings::new(25, 1_000).unwrap();
-        (Registry::new(settings, move || *clock.lock().unwrap()), now)
+        (
+            Registry::new(settings, RETENTION, move || *clock.lock().unwrap()),
+            now,
+        )
     }
 
     fn registration(attempt_id: &str) -> Registration {
@@ -376,6 +447,77 @@ mod tests {
             Heartbeat::Reregister
         );
         assert_eq!(registry.snapshot(None), before);
+    }
+
+    #[test]
+    fn retention_starts_when_sweep_first_observes_the_expired_lease() {
+        let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let (registry, now) = registry(start);
+        registry.register(registration("attempt")).unwrap();
+
+        let expired_at = start + TimeDelta::seconds(1);
+        *now.lock().unwrap() = expired_at;
+        let expired = registry.detail("test-agent").unwrap();
+        assert_eq!(expired.record.status, AgentStatus::Offline);
+        assert_eq!(expired.lease_expires_at, expired_at);
+        assert_eq!(
+            registry.snapshot(Some(AgentStatus::Offline)).as_slice(),
+            std::slice::from_ref(&expired.record)
+        );
+
+        let first_sweep = expired_at + RETENTION;
+        *now.lock().unwrap() = first_sweep;
+        registry.sweep();
+        assert_eq!(registry.detail("test-agent"), Some(expired.clone()));
+
+        *now.lock().unwrap() = first_sweep + RETENTION - TimeDelta::milliseconds(1);
+        registry.sweep();
+        assert_eq!(registry.detail("test-agent"), Some(expired));
+
+        *now.lock().unwrap() = first_sweep + RETENTION;
+        registry.sweep();
+        assert!(registry.detail("test-agent").is_none());
+    }
+
+    #[test]
+    fn sweeping_keeps_the_session_for_deregistration_until_it_is_revoked() {
+        let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let (registry, now) = registry(start);
+        let first = registry.register(registration("first")).unwrap();
+        *now.lock().unwrap() = start + TimeDelta::seconds(1);
+        registry.sweep();
+        registry
+            .deregister("test-agent", &first.id.to_string())
+            .unwrap();
+
+        let second = registry.register(registration("second")).unwrap();
+        let session_id = second.id.to_string();
+        *now.lock().unwrap() = start + TimeDelta::seconds(2);
+        registry.sweep();
+        registry
+            .manage("test-agent", ManagementAction::Disable)
+            .unwrap();
+        assert_eq!(
+            registry.heartbeat("test-agent", Some(&session_id)),
+            Ok(Heartbeat::Stop)
+        );
+
+        *now.lock().unwrap() += RETENTION;
+        registry.sweep();
+        let enabled = registry
+            .manage("test-agent", ManagementAction::Enable)
+            .unwrap();
+        assert_eq!(enabled.record.status, AgentStatus::Offline);
+        assert_eq!(
+            registry.deregister("test-agent", &session_id),
+            Err(RegistryError::UnknownSession("test-agent".to_owned()))
+        );
+        registry.sweep();
+        assert_eq!(registry.detail("test-agent"), Some(enabled));
+
+        *now.lock().unwrap() += RETENTION;
+        registry.sweep();
+        assert!(registry.detail("test-agent").is_none());
     }
 
     #[test]

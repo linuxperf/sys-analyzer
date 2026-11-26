@@ -131,7 +131,11 @@ impl Controller {
     }
 
     pub async fn serve_with_shutdown(self, shutdown: impl Future<Output = ()>) -> Result<()> {
-        let registry = Arc::new(Registry::new(self.heartbeat, Utc::now));
+        let registry = Arc::new(Registry::new(
+            self.heartbeat,
+            self.offline_retention,
+            Utc::now,
+        ));
         let app = Router::new()
             .route("/health", get(health))
             .route(AGENTS_PATH, get(list_agents))
@@ -153,7 +157,7 @@ impl Controller {
             loop {
                 tokio::select! {
                     () = &mut sweep_shutdown => return Ok(()),
-                    _ = ticks.tick() => sweep_registry.sweep(self.offline_retention),
+                    _ = ticks.tick() => sweep_registry.sweep(),
                 }
             }
         };
@@ -367,7 +371,11 @@ mod tests {
         let heartbeat =
             HeartbeatSettings::new(DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_LEASE_TIMEOUT_MS)
                 .unwrap();
-        GrpcRegistry(Arc::new(Registry::new(heartbeat, Utc::now)))
+        GrpcRegistry(Arc::new(Registry::new(
+            heartbeat,
+            TimeDelta::seconds(60),
+            Utc::now,
+        )))
     }
 
     #[tokio::test]

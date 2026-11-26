@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, pin::pin, time::Duration};
+use std::{
+    collections::BTreeMap,
+    pin::{Pin, pin},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use tokio::{
@@ -88,104 +92,134 @@ pub async fn run(
     maintain_registration(&mut controller, controller_addr, &agent, shutdown).await
 }
 
+enum AttemptEnd {
+    Reregister,
+    Stop,
+    Shutdown {
+        reason: &'static str,
+        session: Option<Session>,
+    },
+}
+
 async fn maintain_registration(
     controller: &mut impl Controller,
     controller_addr: &str,
     agent: &Registration,
     shutdown: impl Future<Output = &'static str>,
 ) -> Result<()> {
-    let agent_id = &agent.agent_id;
     let mut shutdown = pin!(shutdown);
-
     loop {
-        // Retries of this registration can replay a committed Controller response.
         let attempt_id = Uuid::new_v4();
-        let session = loop {
-            // Allow an in-flight Register to finish so shutdown can use its session ID.
-            match controller.register(agent, attempt_id).await {
-                Ok(session) => break session,
-                Err(RpcError::Retryable(error)) => {
-                    eprintln!(
-                        "Registration for Agent {agent_id:?} at {controller_addr} failed and will retry ({error})"
-                    );
-                    tokio::select! {
-                        biased;
-                        reason = &mut shutdown => {
-                            finish_shutdown(agent_id, async {
-                                // A retryable error may mean the successful reply was lost.
-                                let session = controller.register(agent, attempt_id).await.map_err(
-                                    |error| match error {
-                                        RpcError::Retryable(error) | RpcError::Fatal(error) => error,
-                                    },
-                                )?;
-                                deregister_with_retry(controller, agent_id, &session.id, reason).await
-                            }).await;
-                            return Ok(());
-                        }
-                        _ = sleep(CONTROLLER_RETRY_DELAY) => {}
-                    }
-                }
-                Err(RpcError::Fatal(error)) => return Err(error),
-            }
-        };
-
-        let period = session.heartbeat_interval;
-        ensure!(
-            !period.is_zero(),
-            "Controller returned a zero heartbeat interval"
-        );
-        println!("Agent {agent_id:?} registered with session {}", session.id);
-
-        let mut ticks = interval_at(Instant::now() + period, period);
-        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            let heartbeat = tokio::select! {
-                biased;
-                reason = &mut shutdown => {
-                    finish_shutdown(
-                        agent_id,
-                        deregister_with_retry(controller, agent_id, &session.id, reason),
-                    ).await;
-                    return Ok(());
-                }
-                result = async {
-                    ticks.tick().await;
-                    controller.heartbeat(agent_id, &session.id).await
-                } => result,
-            };
-            match heartbeat {
-                Ok(Heartbeat::Continue) => {}
-                Ok(Heartbeat::Reregister) => break,
-                Ok(Heartbeat::Stop) => {
-                    println!("Controller requested stop for Agent {agent_id:?}");
-                    return Ok(());
-                }
-                Err(RpcError::Retryable(error)) => {
-                    eprintln!("Heartbeat for Agent {agent_id:?} failed and will retry ({error})");
-                    ticks.reset_after(CONTROLLER_RETRY_DELAY);
-                }
-                Err(RpcError::Fatal(error)) => return Err(error),
+        match run_attempt(
+            controller,
+            controller_addr,
+            agent,
+            attempt_id,
+            shutdown.as_mut(),
+        )
+        .await?
+        {
+            AttemptEnd::Reregister => {}
+            AttemptEnd::Stop => return Ok(()),
+            AttemptEnd::Shutdown { reason, session } => {
+                shutdown_registration(controller, agent, attempt_id, session, reason).await;
+                return Ok(());
             }
         }
     }
 }
 
-async fn deregister_with_retry(
+async fn run_attempt(
     controller: &mut impl Controller,
-    agent_id: &str,
-    session_id: &str,
-    reason: &str,
-) -> Result<()> {
+    controller_addr: &str,
+    agent: &Registration,
+    attempt_id: Uuid,
+    mut shutdown: Pin<&mut impl Future<Output = &'static str>>,
+) -> Result<AttemptEnd> {
+    let agent_id = &agent.agent_id;
+    let session = loop {
+        // Await an in-flight Register so shutdown can use its session ID. Retrying
+        // with the same attempt ID can retrieve a response already committed.
+        match controller.register(agent, attempt_id).await {
+            Ok(session) => break session,
+            Err(RpcError::Retryable(error)) => {
+                eprintln!(
+                    "Registration for Agent {agent_id:?} at {controller_addr} failed and will retry ({error})"
+                );
+                tokio::select! {
+                    biased;
+                    reason = &mut shutdown => {
+                        return Ok(AttemptEnd::Shutdown { reason, session: None });
+                    }
+                    _ = sleep(CONTROLLER_RETRY_DELAY) => {}
+                }
+            }
+            Err(RpcError::Fatal(error)) => return Err(error),
+        }
+    };
+
+    let period = session.heartbeat_interval;
+    ensure!(
+        !period.is_zero(),
+        "Controller returned a zero heartbeat interval"
+    );
+    println!("Agent {agent_id:?} registered with session {}", session.id);
+
+    let mut ticks = interval_at(Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        match controller.deregister(agent_id, session_id, reason).await {
-            Ok(()) => return Ok(()),
-            Err(RpcError::Retryable(_)) => sleep(DEREGISTER_RETRY_DELAY).await,
+        let heartbeat = tokio::select! {
+            biased;
+            reason = &mut shutdown => {
+                return Ok(AttemptEnd::Shutdown { reason, session: Some(session) });
+            }
+            result = async {
+                ticks.tick().await;
+                controller.heartbeat(agent_id, &session.id).await
+            } => result,
+        };
+        match heartbeat {
+            Ok(Heartbeat::Continue) => {}
+            Ok(Heartbeat::Reregister) => return Ok(AttemptEnd::Reregister),
+            Ok(Heartbeat::Stop) => {
+                println!("Controller requested stop for Agent {agent_id:?}");
+                return Ok(AttemptEnd::Stop);
+            }
+            Err(RpcError::Retryable(error)) => {
+                eprintln!("Heartbeat for Agent {agent_id:?} failed and will retry ({error})");
+                ticks.reset_after(CONTROLLER_RETRY_DELAY);
+            }
             Err(RpcError::Fatal(error)) => return Err(error),
         }
     }
 }
 
-async fn finish_shutdown(agent_id: &str, cleanup: impl Future<Output = Result<()>>) {
+async fn shutdown_registration(
+    controller: &mut impl Controller,
+    agent: &Registration,
+    attempt_id: Uuid,
+    session: Option<Session>,
+    reason: &str,
+) {
+    let agent_id = &agent.agent_id;
+    let cleanup = async {
+        let session = match session {
+            Some(session) => session,
+            // A retryable registration error may mean only the response was lost.
+            None => match controller.register(agent, attempt_id).await {
+                Ok(session) => session,
+                Err(RpcError::Retryable(error) | RpcError::Fatal(error)) => return Err(error),
+            },
+        };
+
+        loop {
+            match controller.deregister(agent_id, &session.id, reason).await {
+                Ok(()) => return Ok(()),
+                Err(RpcError::Retryable(_)) => sleep(DEREGISTER_RETRY_DELAY).await,
+                Err(RpcError::Fatal(error)) => return Err(error),
+            }
+        }
+    };
     if let Err(error) = timeout(SHUTDOWN_CLEANUP_TIMEOUT, cleanup)
         .await
         .context("shutdown cleanup timed out")
