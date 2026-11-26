@@ -73,6 +73,8 @@ pub(super) enum RegistryError {
     BlankAgentId,
     AlreadyRegistered(String),
     LeaseExpirationOutOfRange,
+    InvalidSessionId,
+    UnknownSession(String),
 }
 
 struct RegisteredAgent {
@@ -157,6 +159,22 @@ impl Registry {
         let lease_expires_at = self.heartbeat.lease_expires_at(received_at)?;
         agent.record.last_heartbeat_at = Some(received_at);
         Ok(Heartbeat::Renewed { lease_expires_at })
+    }
+
+    pub(super) fn deregister(&self, agent_id: &str, session_id: &str) -> Result<(), RegistryError> {
+        if agent_id.trim().is_empty() {
+            return Err(RegistryError::BlankAgentId);
+        }
+        let session_id =
+            Uuid::parse_str(session_id).map_err(|_| RegistryError::InvalidSessionId)?;
+        let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
+        match agents.entry(agent_id.to_owned()) {
+            Entry::Occupied(entry) if entry.get().session_id == session_id => {
+                entry.remove();
+                Ok(())
+            }
+            _ => Err(RegistryError::UnknownSession(agent_id.to_owned())),
+        }
     }
 
     pub(super) fn snapshot(&self) -> Vec<AgentRecord> {

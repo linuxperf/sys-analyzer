@@ -4,8 +4,8 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use sys_analyzer_shared::{
     grpc::{
-        HeartbeatDirective, HeartbeatRequest, HeartbeatResponse, RegisterRequest,
-        agent_registration_client::AgentRegistrationClient,
+        DeregisterRequest, HeartbeatDirective, HeartbeatRequest, HeartbeatResponse,
+        RegisterRequest, agent_registration_client::AgentRegistrationClient,
     },
     parse_controller_url,
 };
@@ -71,6 +71,22 @@ impl Controller for GrpcController {
             .await;
 
         heartbeat_outcome(agent_id, response)
+    }
+
+    async fn deregister(&mut self, agent_id: &str, session_id: &str, reason: &str) -> Result<()> {
+        match self
+            .client
+            .deregister(DeregisterRequest {
+                agent_id: agent_id.to_owned(),
+                reason: reason.to_owned(),
+                session_id: session_id.to_owned(),
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::NotFound => Ok(()),
+            Err(status) => Err(status.into()),
+        }
     }
 }
 

@@ -5,6 +5,7 @@ package sys_analyzer.control.v1;
 service AgentRegistration {
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
 }
 
 message RegisterRequest {
@@ -40,3 +41,12 @@ message HeartbeatResponse {
   // Set only when the heartbeat renews a lease.
   int64 lease_expires_at_unix_ms = 2;
 }
+
+message DeregisterRequest {
+  string agent_id = 1;
+  string reason = 2;
+  // The current session ID returned by Register.
+  string session_id = 3;
+}
+
+message DeregisterResponse {}
