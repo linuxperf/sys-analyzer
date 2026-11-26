@@ -108,6 +108,7 @@ fn heartbeat_outcome(
     match HeartbeatDirective::try_from(directive) {
         Ok(HeartbeatDirective::Continue) => Ok(Heartbeat::Continue),
         Ok(HeartbeatDirective::Reregister) => Ok(Heartbeat::Reregister),
+        Ok(HeartbeatDirective::Stop) => Ok(Heartbeat::Stop),
         _ => Err(RpcError::Fatal(anyhow!(
             "Controller returned unexpected heartbeat directive {directive} for Agent {agent_id:?}"
         ))),

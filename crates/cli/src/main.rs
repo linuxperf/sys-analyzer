@@ -4,21 +4,26 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use chrono::DateTime;
 use clap::{Parser, Subcommand, ValueEnum};
-use http::{Uri, uri::PathAndQuery};
+use http::{Method, Request, Uri, uri::PathAndQuery};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Serialize, de::DeserializeOwned};
 use sys_analyzer_shared::{
-    AGENTS_PATH, AgentDetail, AgentRecord, AgentStatus, DEFAULT_REST_ADDR, parse_controller_url,
+    AGENTS_PATH, AgentDetail, AgentRecord, AgentStatus, DEFAULT_REST_ADDR, ErrorBody,
+    parse_controller_url,
 };
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Parser)]
-#[command(version, about = "Query the sys-analyzer Controller")]
+#[command(
+    version,
+    about = "Query and manage Agents through the sys-analyzer Controller"
+)]
 struct Args {
     #[arg(long, global = true, env = "SYS_ANALYZER_REST_URL", default_value_t = format!("http://{DEFAULT_REST_ADDR}"))]
     controller: String,
@@ -36,11 +41,20 @@ enum Command {
         output: Output,
     },
     /// Show a registered Agent and its lease
-    Show {
-        agent_id: String,
-        #[arg(short, long, value_enum, default_value_t = Output::Table)]
-        output: Output,
-    },
+    Show(AgentCommand),
+    /// Disable an Agent and request that it stop
+    Disable(AgentCommand),
+    /// Enable an Agent to register again
+    Enable(AgentCommand),
+    /// Remove an Agent record
+    Remove(AgentCommand),
+}
+
+#[derive(clap::Args)]
+struct AgentCommand {
+    agent_id: String,
+    #[arg(short, long, value_enum, default_value_t = Output::Table)]
+    output: Output,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -105,48 +119,113 @@ async fn main() -> Result<()> {
                 }
                 None => PathAndQuery::from_static(AGENTS_PATH),
             };
-            let agents: Vec<AgentRecord> = get_controller(&args.controller, path)
+            let agents: Vec<AgentRecord> = request_json(&args.controller, Method::GET, path)
                 .await
                 .with_context(|| format!("query Controller at {}", args.controller))?;
             write_list(&mut stdout.lock(), &agents, output)?;
         }
-        Command::Show { agent_id, output } => {
-            let encoded_id = utf8_percent_encode(&agent_id, NON_ALPHANUMERIC);
-            let path = PathAndQuery::try_from(format!("{AGENTS_PATH}/{encoded_id}"))?;
-            let detail = get_controller(&args.controller, path)
-                .await
-                .with_context(|| {
-                    format!("query Agent {agent_id:?} at Controller {}", args.controller)
-                })?;
-            write_detail(&mut stdout.lock(), &detail, output)?;
+        Command::Show(target) => {
+            let detail = request_agent_detail(&args.controller, &target.agent_id, None).await?;
+            write_detail(&mut stdout.lock(), &detail, target.output)?;
+        }
+        Command::Disable(target) => {
+            let detail =
+                request_agent_detail(&args.controller, &target.agent_id, Some("disable")).await?;
+            write_detail(&mut stdout.lock(), &detail, target.output)?;
+        }
+        Command::Enable(target) => {
+            let detail =
+                request_agent_detail(&args.controller, &target.agent_id, Some("enable")).await?;
+            write_detail(&mut stdout.lock(), &detail, target.output)?;
+        }
+        Command::Remove(target) => {
+            let agent_id = &target.agent_id;
+            request_controller(
+                &args.controller,
+                Method::DELETE,
+                agent_path(agent_id, None)?,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "remove Agent {agent_id:?} at Controller {}",
+                    args.controller
+                )
+            })?;
+            write_removal(&mut stdout.lock(), agent_id, target.output)?;
         }
     }
     stdout.lock().flush()?;
     Ok(())
 }
 
-async fn get_controller<T: DeserializeOwned>(controller: &str, path: PathAndQuery) -> Result<T> {
+fn agent_path(agent_id: &str, action: Option<&str>) -> Result<PathAndQuery> {
+    let encoded_id = utf8_percent_encode(agent_id, NON_ALPHANUMERIC);
+    let path = match action {
+        Some(action) => format!("{AGENTS_PATH}/{encoded_id}/{action}"),
+        None => format!("{AGENTS_PATH}/{encoded_id}"),
+    };
+    Ok(PathAndQuery::try_from(path)?)
+}
+
+async fn request_agent_detail(
+    controller: &str,
+    agent_id: &str,
+    action: Option<&str>,
+) -> Result<AgentDetail> {
+    let method = if action.is_some() {
+        Method::POST
+    } else {
+        Method::GET
+    };
+    request_json(controller, method, agent_path(agent_id, action)?)
+        .await
+        .with_context(|| {
+            let operation = action.unwrap_or("query");
+            format!("{operation} Agent {agent_id:?} at Controller {controller}")
+        })
+}
+
+async fn request_json<T: DeserializeOwned>(
+    controller: &str,
+    method: Method,
+    path: PathAndQuery,
+) -> Result<T> {
+    let body = request_controller(controller, method, path).await?;
+    serde_json::from_slice(&body).context("invalid Agent data from Controller")
+}
+
+async fn request_controller(controller: &str, method: Method, path: PathAndQuery) -> Result<Bytes> {
     let mut parts = parse_controller_url(controller)?.into_parts();
     parts.path_and_query = Some(path);
     let uri = Uri::from_parts(parts)?;
-    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<bytes::Bytes>>();
-    let body = tokio::time::timeout(Duration::from_secs(5), async {
-        let response = client.get(uri).await.context("HTTP request failed")?;
-        ensure!(
-            response.status().is_success(),
-            "Controller returned HTTP {}",
-            response.status()
-        );
-        response
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Empty::new())?;
+    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<Bytes>>();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let response = client
+            .request(request)
+            .await
+            .context("HTTP request failed")?;
+        let status = response.status();
+        let body = response
             .into_body()
             .collect()
             .await
-            .context("read Controller response")
+            .context("read Controller response")?
+            .to_bytes();
+        if !status.is_success() {
+            if let Ok(ErrorBody { error }) = serde_json::from_slice(&body) {
+                bail!("Controller returned HTTP {status}: {error}");
+            }
+            bail!("Controller returned HTTP {status}");
+        }
+        Ok(body)
     })
     .await
-    .context("Controller request timed out")??
-    .to_bytes();
-    serde_json::from_slice(&body).context("invalid Agent data from Controller")
+    .context("Controller request timed out")?
 }
 
 fn write_list(writer: &mut impl Write, agents: &[AgentRecord], output: Output) -> Result<()> {
@@ -169,6 +248,20 @@ fn write_detail(writer: &mut impl Write, detail: &AgentDetail, output: Output) -
             Ok(())
         }
         Output::Json => write_json(writer, &row),
+    }
+}
+
+fn write_removal(writer: &mut impl Write, agent_id: &str, output: Output) -> Result<()> {
+    match output {
+        Output::Table => {
+            writeln!(writer, "Agent ID  {}", escape_control(agent_id))?;
+            writeln!(writer, "Result    Removed")?;
+            Ok(())
+        }
+        Output::Json => write_json(
+            writer,
+            &serde_json::json!({ "agent_id": agent_id, "removed": true }),
+        ),
     }
 }
 

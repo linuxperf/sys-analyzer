@@ -296,6 +296,147 @@ class ControlPlaneTests(unittest.TestCase):
                 agents = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
                 self.assertNotIn(agent_id, {entry["agent_id"] for entry in agents})
 
+    def test_disabling_an_online_agent_stops_it_and_rejects_its_id(self):
+        rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
+        agent_id = "rack/节点?worker=%"
+        agent, log = self.start_agent(grpc_addr, "--agent-id", agent_id)
+        self.wait_for_registration(agent, log)
+
+        detail = json.loads(self.cli(rest_addr, "disable", agent_id, "--output", "json").stdout)
+        self.assertEqual(detail["agent_id"], agent_id)
+        self.assertEqual(detail["status"], "Disabled")
+        self.assertEqual(agent.wait(timeout=TIMEOUT), 0, log.read_text())
+        self.assertIn("Controller requested stop", log.read_text())
+
+        replacement, replacement_log = self.start_agent(grpc_addr, "--agent-id", agent_id)
+        self.assertNotEqual(replacement.wait(timeout=TIMEOUT), 0, replacement_log.read_text())
+        self.assertIn("is disabled", replacement_log.read_text())
+        rows = json.loads(self.cli(rest_addr, "list", "--status", "disabled",
+                                   "--output", "json").stdout)
+        self.assertEqual([row["agent_id"] for row in rows], [agent_id])
+
+    def test_agent_can_rejoin_after_enable_and_old_deregistration(self):
+        for enable_before_deregister in (False, True):
+            with self.subTest(enable_before_deregister=enable_before_deregister):
+                rest_addr, grpc_addr = self.start_controller("--lease-timeout-ms", "60000")
+                proxy_addr, release_reply = self.start_grpc_reply_proxy(grpc_addr, 1, hold=True)
+                agent_id = "returning-agent"
+                agent, log = self.start_agent(proxy_addr, "--agent-id", agent_id)
+                self.wait_for_agent_status(rest_addr, agent_id, "Online")
+
+                connection = http.client.HTTPConnection(rest_addr, timeout=TIMEOUT)
+                self.addCleanup(connection.close)
+                connection.request("POST", f"/agents/{agent_id}/disable")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.load(response)["status"], "Disabled")
+
+                if enable_before_deregister:
+                    self.assertIn("Offline", self.cli(rest_addr, "enable", agent_id).stdout)
+                agent.send_signal(signal.SIGTERM)
+                release_reply.set()
+                self.assertEqual(agent.wait(timeout=TIMEOUT), 0, log.read_text())
+                _, original_session = self.wait_for_registration(agent, log)
+
+                status = "Offline" if enable_before_deregister else "Disabled"
+                self.assertEqual(self.wait_for_agent_status(rest_addr, agent_id, status)["pid"],
+                                 agent.pid)
+                if not enable_before_deregister:
+                    self.assertIn("Offline", self.cli(rest_addr, "enable", agent_id).stdout)
+
+                replacement, replacement_log = self.start_agent(grpc_addr, "--agent-id", agent_id)
+                _, new_session = self.wait_for_registration(replacement, replacement_log)
+                self.assertNotEqual(new_session, original_session)
+                self.assertEqual(self.wait_for_agent_status(rest_addr, agent_id, "Online")["pid"],
+                                 replacement.pid)
+
+    def test_removing_a_running_agent_deletes_its_record_and_it_can_register_again(self):
+        rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
+        proxy_addr, release_reply = self.start_grpc_reply_proxy(grpc_addr, 1, hold=True)
+        agent_id = "."
+        agent, log = self.start_agent(proxy_addr, "--agent-id", agent_id)
+        self.wait_for_agent_status(rest_addr, agent_id, "Online")
+
+        output = self.cli(rest_addr, "remove", agent_id, "--output", "json")
+        self.assertEqual(json.loads(output.stdout), {"agent_id": agent_id, "removed": True})
+        self.assertEqual(json.loads(self.cli(rest_addr, "list", "--output", "json").stdout), [])
+
+        release_reply.set()
+        _, first_session = self.wait_for_registration(agent, log)
+        self.wait_for_output(
+            agent, log,
+            rf'^Agent "{re.escape(agent_id)}" registered with session (?!{first_session}$)[0-9a-f-]+$',
+        )
+        self.assertEqual(self.wait_for_agent_status(rest_addr, agent_id, "Online")["pid"],
+                         agent.pid)
+        self.assertIn("Removed", self.cli(rest_addr, "remove", agent_id).stdout)
+
+    def test_disabled_offline_agent_survives_sweeping_until_it_is_enabled(self):
+        rest_addr, grpc_addr = self.start_controller(
+            "--heartbeat-interval-ms", "40", "--lease-timeout-ms", "300",
+            "--offline-retention-ms", "1000", "--sweep-interval-ms", "20",
+        )
+        agent_id = "retained-agent"
+        agent, log = self.start_agent(grpc_addr, "--agent-id", agent_id)
+        self.wait_for_registration(agent, log)
+        agent.kill()
+        agent.wait(timeout=TIMEOUT)
+        self.wait_for_agent_status(rest_addr, agent_id, "Offline")
+        self.assertIn("Disabled", self.cli(rest_addr, "disable", agent_id).stdout)
+
+        # A later registration must pass through Offline and be evicted while
+        # the disabled record remains, even under the same retention settings.
+        later, later_log = self.start_agent(grpc_addr, "--agent-id", "later-agent")
+        self.wait_for_registration(later, later_log)
+        later.kill()
+        later.wait(timeout=TIMEOUT)
+        self.wait_for_agent_status(rest_addr, "later-agent", None)
+        self.assertEqual(self.wait_for_agent_status(rest_addr, agent_id, "Disabled")["pid"],
+                         agent.pid)
+
+        connection = http.client.HTTPConnection(rest_addr, timeout=TIMEOUT)
+        self.addCleanup(connection.close)
+        connection.request("POST", f"/agents/{agent_id}/enable")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.load(response)["status"], "Offline")
+        self.wait_for_agent_status(rest_addr, agent_id, None)
+
+    def test_management_rest_and_cli_errors_name_the_agent_and_state(self):
+        rest_addr, grpc_addr = self.start_controller("--heartbeat-interval-ms", "100")
+        agent_id = "managed-agent"
+        agent, log = self.start_agent(grpc_addr, "--agent-id", agent_id)
+        self.wait_for_registration(agent, log)
+        connection = http.client.HTTPConnection(rest_addr, timeout=TIMEOUT)
+        self.addCleanup(connection.close)
+
+        def assert_error(command, status, reason):
+            method, path = ("DELETE", f"/agents/{agent_id}") if command == "remove" else (
+                "POST", f"/agents/{agent_id}/{command}",
+            )
+            connection.request(method, path)
+            response = connection.getresponse()
+            self.assertEqual(response.status, status)
+            self.assertEqual(json.load(response), {"error": reason})
+            output = self.cli(rest_addr, command, agent_id, "--output", "json", check=False)
+            self.assertNotEqual(output.returncode, 0)
+            self.assertEqual(output.stdout, "")
+            self.assertIn(f"HTTP {status}", output.stderr)
+            self.assertIn(reason, output.stderr)
+
+        assert_error("enable", 409, f'Agent "{agent_id}" is not disabled')
+        self.cli(rest_addr, "disable", agent_id)
+        self.assertEqual(agent.wait(timeout=TIMEOUT), 0, log.read_text())
+        assert_error("disable", 409, f'Agent "{agent_id}" is already disabled')
+
+        connection.request("DELETE", f"/agents/{agent_id}")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 204)
+        self.assertEqual(response.read(), b"")
+        for command in ("disable", "enable", "remove"):
+            with self.subTest(command=command):
+                assert_error(command, 404, f'Agent "{agent_id}" was not found')
+
     def test_agent_shutdown_deregisters_even_when_the_registration_reply_is_lost(self):
         rest_addr, grpc_addr = self.start_controller("--lease-timeout-ms", "60000")
         proxy_addr, release_reply = self.start_grpc_reply_proxy(
