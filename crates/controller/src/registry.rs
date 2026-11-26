@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Mutex, time::Duration};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    sync::Mutex,
+    time::Duration,
+};
 
 use anyhow::{Context, ensure};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -69,6 +73,8 @@ pub(super) enum RegistryError {
     BlankAgentId,
     AlreadyRegistered(String),
     LeaseExpirationOutOfRange,
+    InvalidSessionId,
+    UnknownSession(String),
 }
 
 struct RegisteredAgent {
@@ -188,6 +194,22 @@ impl Registry {
                 .is_none_or(|offline_since| now - offline_since < offline_retention),
             AgentStatus::Disabled => true,
         });
+    }
+
+    pub(super) fn deregister(&self, agent_id: &str, session_id: &str) -> Result<(), RegistryError> {
+        if agent_id.trim().is_empty() {
+            return Err(RegistryError::BlankAgentId);
+        }
+        let session_id =
+            Uuid::parse_str(session_id).map_err(|_| RegistryError::InvalidSessionId)?;
+        let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
+        match agents.entry(agent_id.to_owned()) {
+            Entry::Occupied(entry) if entry.get().session_id == session_id => {
+                entry.remove();
+                Ok(())
+            }
+            _ => Err(RegistryError::UnknownSession(agent_id.to_owned())),
+        }
     }
 
     pub(super) fn snapshot(&self, status: Option<AgentStatus>) -> Vec<AgentRecord> {

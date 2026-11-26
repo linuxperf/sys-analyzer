@@ -283,6 +283,42 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(row["pid"], agent.pid)
         self.assertEqual(row["status"], "Online")
 
+    def test_agent_deregisters_before_exiting_on_a_termination_signal(self):
+        rest_addr, grpc_addr = self.start_controller("--lease-timeout-ms", "60000")
+
+        for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=shutdown_signal.name):
+                agent_id = f"departing-agent-{shutdown_signal.name}"
+                agent, log = self.start_agent(grpc_addr, "--agent-id", agent_id)
+                self.wait_for_registration(agent, log)
+                agent.send_signal(shutdown_signal)
+                self.assertEqual(agent.wait(timeout=TIMEOUT), 0, log.read_text())
+                agents = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+                self.assertNotIn(agent_id, {entry["agent_id"] for entry in agents})
+
+    def test_agent_shutdown_deregisters_even_when_the_registration_reply_is_lost(self):
+        rest_addr, grpc_addr = self.start_controller("--lease-timeout-ms", "60000")
+        proxy_addr, release_reply = self.start_grpc_reply_proxy(
+            grpc_addr, 1, reset=True, hold=True,
+        )
+        agent, log = self.start_agent(proxy_addr, "--agent-id", "departing-agent")
+
+        deadline = time.monotonic() + TIMEOUT
+        while time.monotonic() < deadline:
+            agents = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+            if agents:
+                self.assertEqual(agents[0]["agent_id"], "departing-agent")
+                break
+            time.sleep(0.025)
+        else:
+            self.fail("Controller did not register the Agent while the reply was held")
+
+        agent.send_signal(signal.SIGTERM)
+        release_reply.set()
+
+        self.assertEqual(agent.wait(timeout=TIMEOUT), 0, log.read_text())
+        self.assertEqual(json.loads(self.cli(rest_addr, "list", "--output", "json").stdout), [])
+
     def test_agent_retries_after_tcp_reset_during_registration_or_heartbeat(self):
         for stream_id, call in ((1, "Registration"), (3, "Heartbeat")):
             with self.subTest(call=call):
@@ -419,7 +455,7 @@ class ControlPlaneTests(unittest.TestCase):
             time.sleep(0.025)
         self.fail("Agent did not report a new heartbeat")
 
-    def start_grpc_reply_proxy(self, grpc_addr, stream_id, *, reset=False):
+    def start_grpc_reply_proxy(self, grpc_addr, stream_id, *, reset=False, hold=False):
         upstream_host, upstream_port = grpc_addr.split(":")
         upstream_addr = (upstream_host, int(upstream_port))
         fault_injected = threading.Event()
@@ -456,11 +492,11 @@ class ControlPlaneTests(unittest.TestCase):
                         reply_stream = int.from_bytes(pending[5:9], "big") & 0x7fffffff
                         if pending[3] == 0x01 and reply_stream == stream_id and not fault_injected.is_set():
                             fault_injected.set()
+                            if (not reset or hold) and not release_reply.wait(TIMEOUT):
+                                return
                             if reset:
                                 downstream.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
                                 downstream.close()
-                                return
-                            if not release_reply.wait(TIMEOUT):
                                 return
                         downstream.sendall(pending[:frame_end])
                         del pending[:frame_end]

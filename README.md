@@ -39,6 +39,8 @@ CLI 的表格和 JSON 都使用整数 Unix 秒展示时间。例如，`2024-01-0
 Controller 暂时无法连接，或注册、心跳 RPC 超时时，Agent 会等待 3 秒再重试。
 如果 Controller 已完成注册且租约仍然有效，重试同一次注册会取回原会话。
 
+Agent 收到 `SIGINT` 或 `SIGTERM` 时会停止心跳并请求注销当前会话，Controller 确认后立即从列表移除该节点。如果 Controller 暂时不可达，Agent 会在有限时间内退出。
+
 ## 地址配置
 
 | 组件 | 参数 | 环境变量 | 默认值 |

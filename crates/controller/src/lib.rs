@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use sys_analyzer_shared::{
     AGENTS_PATH, AgentDetail, AgentRecord, AgentStatus,
     grpc::{
-        HeartbeatDirective, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse,
+        DeregisterRequest, DeregisterResponse, HeartbeatDirective, HeartbeatRequest,
+        HeartbeatResponse, RegisterRequest, RegisterResponse,
         agent_registration_server::{AgentRegistration, AgentRegistrationServer},
     },
 };
@@ -229,6 +230,21 @@ impl AgentRegistration for GrpcRegistry {
         };
         Ok(Response::new(response))
     }
+
+    async fn deregister(
+        &self,
+        request: Request<DeregisterRequest>,
+    ) -> Result<Response<DeregisterResponse>, Status> {
+        let request = request.into_inner();
+        self.0
+            .deregister(&request.agent_id, &request.session_id)
+            .map_err(registry_status)?;
+        println!(
+            "Agent {:?} deregistered ({:?})",
+            request.agent_id, request.reason
+        );
+        Ok(Response::new(DeregisterResponse {}))
+    }
 }
 
 fn registry_status(error: RegistryError) -> Status {
@@ -239,6 +255,10 @@ fn registry_status(error: RegistryError) -> Status {
         }
         RegistryError::LeaseExpirationOutOfRange => {
             Status::out_of_range("lease expiration is out of range")
+        }
+        RegistryError::InvalidSessionId => Status::invalid_argument("session_id must be a UUID"),
+        RegistryError::UnknownSession(agent_id) => {
+            Status::not_found(format!("No matching session for Agent {agent_id:?}"))
         }
     }
 }
