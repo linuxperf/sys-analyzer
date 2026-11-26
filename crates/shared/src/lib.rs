@@ -54,6 +54,11 @@ pub struct AgentDetail {
     pub lease_expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ErrorBody {
+    pub error: String,
+}
+
 pub mod grpc {
     tonic::include_proto!("sys_analyzer.control.v1");
 }

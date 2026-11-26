@@ -5,12 +5,12 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
 };
 use chrono::{TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use sys_analyzer_shared::{
-    AGENTS_PATH, AgentDetail, AgentRecord, AgentStatus,
+    AGENTS_PATH, AgentDetail, AgentRecord, AgentStatus, ErrorBody,
     grpc::{
         DeregisterRequest, DeregisterResponse, HeartbeatDirective, HeartbeatRequest,
         HeartbeatResponse, RegisterRequest, RegisterResponse,
@@ -23,7 +23,10 @@ use tonic::{Request, Response, Status, transport::Server};
 
 mod registry;
 
-use registry::{Heartbeat, HeartbeatSettings, Registration, Registry, RegistryError};
+use registry::{
+    Heartbeat, HeartbeatSettings, ManagementAction, ManagementError, Registration, Registry,
+    RegistryError,
+};
 
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 pub const DEFAULT_LEASE_TIMEOUT_MS: u64 = 15_000;
@@ -132,7 +135,9 @@ impl Controller {
         let app = Router::new()
             .route("/health", get(health))
             .route(AGENTS_PATH, get(list_agents))
-            .route("/agents/{agent_id}", get(agent_detail))
+            .route("/agents/{agent_id}", get(agent_detail).delete(remove_agent))
+            .route("/agents/{agent_id}/disable", post(disable_agent))
+            .route("/agents/{agent_id}/enable", post(enable_agent))
             .with_state(registry.clone());
 
         let (shutdown_sender, shutdown_receiver) = watch::channel(());
@@ -227,6 +232,10 @@ impl AgentRegistration for GrpcRegistry {
                 directive: HeartbeatDirective::Reregister.into(),
                 ..Default::default()
             },
+            Heartbeat::Stop => HeartbeatResponse {
+                directive: HeartbeatDirective::Stop.into(),
+                ..Default::default()
+            },
         };
         Ok(Response::new(response))
     }
@@ -252,6 +261,9 @@ fn registry_status(error: RegistryError) -> Status {
         RegistryError::BlankAgentId => Status::invalid_argument("agent_id must not be blank"),
         RegistryError::AlreadyRegistered(agent_id) => {
             Status::already_exists(format!("Agent {agent_id:?} is already online"))
+        }
+        RegistryError::AgentDisabled(agent_id) => {
+            Status::permission_denied(format!("Agent {agent_id:?} is disabled"))
         }
         RegistryError::LeaseExpirationOutOfRange => {
             Status::out_of_range("lease expiration is out of range")
@@ -284,23 +296,64 @@ async fn list_agents(
     Json(registry.snapshot(query.status))
 }
 
-#[derive(Serialize)]
-struct ErrorBody {
-    error: String,
-}
+type ApiError = (StatusCode, Json<ErrorBody>);
 
 async fn agent_detail(
     State(registry): State<Arc<Registry>>,
     Path(agent_id): Path<String>,
-) -> Result<Json<AgentDetail>, (StatusCode, Json<ErrorBody>)> {
-    registry.detail(&agent_id).map(Json).ok_or_else(|| {
-        (
+) -> Result<Json<AgentDetail>, ApiError> {
+    registry
+        .detail(&agent_id)
+        .map(Json)
+        .ok_or_else(|| management_error(&agent_id, ManagementError::Missing))
+}
+
+async fn disable_agent(
+    State(registry): State<Arc<Registry>>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentDetail>, ApiError> {
+    registry
+        .manage(&agent_id, ManagementAction::Disable)
+        .map(Json)
+        .map_err(|error| management_error(&agent_id, error))
+}
+
+async fn enable_agent(
+    State(registry): State<Arc<Registry>>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentDetail>, ApiError> {
+    registry
+        .manage(&agent_id, ManagementAction::Enable)
+        .map(Json)
+        .map_err(|error| management_error(&agent_id, error))
+}
+
+async fn remove_agent(
+    State(registry): State<Arc<Registry>>,
+    Path(agent_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    registry
+        .remove(&agent_id)
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| management_error(&agent_id, error))
+}
+
+fn management_error(agent_id: &str, error: ManagementError) -> ApiError {
+    let (status, error) = match error {
+        ManagementError::Missing => (
             StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: format!("Agent {agent_id:?} was not found"),
-            }),
-        )
-    })
+            format!("Agent {agent_id:?} was not found"),
+        ),
+        ManagementError::AlreadyDisabled => (
+            StatusCode::CONFLICT,
+            format!("Agent {agent_id:?} is already disabled"),
+        ),
+        ManagementError::NotDisabled => (
+            StatusCode::CONFLICT,
+            format!("Agent {agent_id:?} is not disabled"),
+        ),
+    };
+    (status, Json(ErrorBody { error }))
 }
 
 #[cfg(test)]

@@ -32,6 +32,7 @@ struct Session {
 enum Heartbeat {
     Continue,
     Reregister,
+    Stop,
 }
 
 enum RpcError {
@@ -147,6 +148,10 @@ async fn maintain_registration(
             match heartbeat {
                 Ok(Heartbeat::Continue) => {}
                 Ok(Heartbeat::Reregister) => break,
+                Ok(Heartbeat::Stop) => {
+                    println!("Controller requested stop for Agent {agent_id:?}");
+                    return Ok(());
+                }
                 Err(RpcError::Retryable(error)) => {
                     eprintln!("Heartbeat for Agent {agent_id:?} failed and will retry ({error})");
                     ticks.reset_after(CONTROLLER_RETRY_DELAY);

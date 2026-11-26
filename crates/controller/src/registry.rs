@@ -66,20 +66,33 @@ pub(super) struct RegisteredSession {
 pub(super) enum Heartbeat {
     Renewed { lease_expires_at: DateTime<Utc> },
     Reregister,
+    Stop,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum RegistryError {
     BlankAgentId,
     AlreadyRegistered(String),
+    AgentDisabled(String),
     LeaseExpirationOutOfRange,
     InvalidSessionId,
     UnknownSession(String),
 }
 
+pub(super) enum ManagementAction {
+    Disable,
+    Enable,
+}
+
+pub(super) enum ManagementError {
+    Missing,
+    AlreadyDisabled,
+    NotDisabled,
+}
+
 struct RegisteredAgent {
     record: AgentRecord,
-    session_id: Uuid,
+    session_id: Option<Uuid>,
     registration_attempt_id: String,
     lease_expires_at: DateTime<Utc>,
     offline_since: Option<DateTime<Utc>>,
@@ -88,6 +101,13 @@ struct RegisteredAgent {
 impl RegisteredAgent {
     fn has_active_lease(&self, now: DateTime<Utc>) -> bool {
         self.record.status == AgentStatus::Online && now < self.lease_expires_at
+    }
+
+    fn detail(&self) -> AgentDetail {
+        AgentDetail {
+            record: self.record.clone(),
+            lease_expires_at: self.lease_expires_at,
+        }
     }
 }
 
@@ -119,15 +139,17 @@ impl Registry {
 
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
         let registered_at = (self.clock)();
-        let online_agent = agents
-            .get(&request.agent_id)
-            .filter(|agent| agent.has_active_lease(registered_at));
+        let previous = agents.get(&request.agent_id);
+        if previous.is_some_and(|agent| agent.record.status == AgentStatus::Disabled) {
+            return Err(RegistryError::AgentDisabled(request.agent_id));
+        }
+        let online_agent = previous.filter(|agent| agent.has_active_lease(registered_at));
         let session_id = if let Some(agent) = online_agent {
             if request.attempt_id.is_empty() || request.attempt_id != agent.registration_attempt_id
             {
                 return Err(RegistryError::AlreadyRegistered(request.agent_id));
             }
-            agent.session_id
+            agent.session_id.expect("online Agent has a session")
         } else {
             let lease_expires_at = self.heartbeat.lease_expires_at(registered_at)?;
             let session_id = Uuid::new_v4();
@@ -145,7 +167,7 @@ impl Registry {
                         registered_at,
                         last_heartbeat_at: None,
                     },
-                    session_id,
+                    session_id: Some(session_id),
                     registration_attempt_id: request.attempt_id,
                     lease_expires_at,
                     offline_since: None,
@@ -166,6 +188,9 @@ impl Registry {
         let Some(agent) = agents.get_mut(agent_id) else {
             return Ok(Heartbeat::Reregister);
         };
+        if agent.record.status == AgentStatus::Disabled {
+            return Ok(Heartbeat::Stop);
+        }
 
         // Read Controller time while holding the lock so renewal follows mutation order.
         let received_at = (self.clock)();
@@ -204,7 +229,7 @@ impl Registry {
             Uuid::parse_str(session_id).map_err(|_| RegistryError::InvalidSessionId)?;
         let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
         match agents.entry(agent_id.to_owned()) {
-            Entry::Occupied(entry) if entry.get().session_id == session_id => {
+            Entry::Occupied(entry) if entry.get().session_id == Some(session_id) => {
                 entry.remove();
                 Ok(())
             }
@@ -223,10 +248,41 @@ impl Registry {
 
     pub(super) fn detail(&self, agent_id: &str) -> Option<AgentDetail> {
         let agents = self.agents.lock().expect("Agent registry lock poisoned");
-        agents.get(agent_id).map(|agent| AgentDetail {
-            record: agent.record.clone(),
-            lease_expires_at: agent.lease_expires_at,
-        })
+        agents.get(agent_id).map(RegisteredAgent::detail)
+    }
+
+    pub(super) fn manage(
+        &self,
+        agent_id: &str,
+        action: ManagementAction,
+    ) -> Result<AgentDetail, ManagementError> {
+        let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
+        let agent = agents.get_mut(agent_id).ok_or(ManagementError::Missing)?;
+        match (action, agent.record.status) {
+            (ManagementAction::Disable, AgentStatus::Disabled) => {
+                return Err(ManagementError::AlreadyDisabled);
+            }
+            (ManagementAction::Disable, _) => {
+                agent.record.status = AgentStatus::Disabled;
+                // Revoke the session so a delayed Deregister cannot discard the record.
+                agent.session_id = None;
+                agent.offline_since = None;
+            }
+            (ManagementAction::Enable, AgentStatus::Disabled) => {
+                agent.record.status = AgentStatus::Offline;
+                agent.offline_since = Some((self.clock)());
+            }
+            (ManagementAction::Enable, _) => return Err(ManagementError::NotDisabled),
+        }
+        Ok(agent.detail())
+    }
+
+    pub(super) fn remove(&self, agent_id: &str) -> Result<(), ManagementError> {
+        let mut agents = self.agents.lock().expect("Agent registry lock poisoned");
+        agents
+            .remove(agent_id)
+            .map(|_| ())
+            .ok_or(ManagementError::Missing)
     }
 }
 

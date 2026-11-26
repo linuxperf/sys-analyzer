@@ -1,6 +1,6 @@
 # sys-analyzer
 
-sys-analyzer 的控制面由一个 Controller、多个 Agent 和一个查询 CLI 组成。Agent 通过明文 gRPC（h2c）主动注册，并按 Controller 下发的间隔发送心跳续租。CLI 通过明文 HTTP/1.1 查询 Controller。
+sys-analyzer 的控制面由一个 Controller、多个 Agent 和一个管理 CLI 组成。Agent 通过明文 gRPC（h2c）主动注册，并按 Controller 下发的间隔发送心跳续租。CLI 通过明文 HTTP/1.1 查询和管理 Agent。
 
 ## 本地运行
 
@@ -41,6 +41,26 @@ Controller 暂时无法连接，或注册、心跳 RPC 超时时，Agent 会等�
 
 Agent 收到 `SIGINT` 或 `SIGTERM` 时会停止心跳并请求注销当前会话，Controller 确认后立即从列表移除该节点。如果 Controller 暂时不可达，Agent 会在有限时间内退出。
 
+## 管理 Agent
+
+```sh
+./target/debug/sys-analyzer-cli disable local-agent
+./target/debug/sys-analyzer-cli enable local-agent --output json
+./target/debug/sys-analyzer-cli remove local-agent --output json
+```
+
+禁用操作将 `Online` 或 `Offline` 节点转为 `Disabled`，同时撤销原注册会话。Controller 拒绝该 ID 的注册请求，并在心跳响应中通知 Agent 停止。Agent 收到停止指令后正常退出。禁用记录会跨巡检周期保留。
+
+启用操作将 `Disabled` 节点转为 `Offline`，开始新的离线保留期，并允许该 ID 注册新会话。移除操作立即删除记录并释放该 ID。仍在运行的 Agent 在下一次心跳收到重新注册指令后可以再次上线。
+
+| CLI 子命令 | REST 接口 | 成功响应 |
+| --- | --- | --- |
+| `disable AGENT_ID` | `POST /agents/{agent_id}/disable` | `200`，禁用后的节点详情 |
+| `enable AGENT_ID` | `POST /agents/{agent_id}/enable` | `200`，启用后的节点详情 |
+| `remove AGENT_ID` | `DELETE /agents/{agent_id}` | `204`，空响应体 |
+
+三个子命令均支持 `--output table` 和 `--output json`。移除成功时，CLI 的 JSON 输出为 `{"agent_id":"local-agent","removed":true}`。找不到节点时返回 `404`，重复禁用或启用未禁用节点时返回 `409`。两种错误的响应体均为包含 `error` 字段的 JSON 对象。CLI 会输出 HTTP 状态和错误原因，并返回非零退出码。
+
 ## 地址配置
 
 | 组件 | 参数 | 环境变量 | 默认值 |
@@ -63,4 +83,4 @@ cargo test --locked --workspace
 ./e2e/control_plane.py -v
 ```
 
-端到端测试使用 Python 3.11 或更新版本的标准库。脚本会构建并启动 Controller、Agent 和 CLI，使用临时回环端口验证健康检查、Agent 注册和冲突处理、多 Agent 心跳保活、CLI 查询及连接失败。
+端到端测试使用 Python 3.11 或更新版本的标准库。脚本会构建并启动 Controller、Agent 和 CLI，使用临时回环端口验证健康检查、Agent 注册和冲突处理、多 Agent 心跳保活、CLI 查询、禁用、启用、移除及错误处理。
