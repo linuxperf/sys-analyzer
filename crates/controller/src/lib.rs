@@ -1,17 +1,22 @@
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{future, io, net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result};
-use axum::{Json, Router, extract::State, routing::get};
-use chrono::Utc;
-use serde::Serialize;
+use anyhow::{Context, Result, ensure};
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::get,
+};
+use chrono::{TimeDelta, Utc};
+use serde::{Deserialize, Serialize};
 use sys_analyzer_shared::{
-    AGENTS_PATH, AgentRecord,
+    AGENTS_PATH, AgentDetail, AgentRecord, AgentStatus,
     grpc::{
         HeartbeatDirective, HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse,
         agent_registration_server::{AgentRegistration, AgentRegistrationServer},
     },
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 
@@ -21,22 +26,38 @@ use registry::{Heartbeat, HeartbeatSettings, Registration, Registry, RegistryErr
 
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 pub const DEFAULT_LEASE_TIMEOUT_MS: u64 = 15_000;
+pub const DEFAULT_OFFLINE_RETENTION_MS: u64 = 60_000;
+pub const DEFAULT_SWEEP_INTERVAL_MS: u64 = 1_000;
+
+pub struct LifecycleSettings {
+    pub heartbeat_interval_ms: u64,
+    pub lease_timeout_ms: u64,
+    pub offline_retention_ms: u64,
+    pub sweep_interval_ms: u64,
+}
+
+impl Default for LifecycleSettings {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
+            lease_timeout_ms: DEFAULT_LEASE_TIMEOUT_MS,
+            offline_retention_ms: DEFAULT_OFFLINE_RETENTION_MS,
+            sweep_interval_ms: DEFAULT_SWEEP_INTERVAL_MS,
+        }
+    }
+}
 
 pub struct Controller {
     rest: TcpListener,
     grpc: TcpListener,
     heartbeat: HeartbeatSettings,
+    offline_retention: TimeDelta,
+    sweep_interval: Duration,
 }
 
 impl Controller {
     pub async fn bind(rest_addr: SocketAddr, grpc_addr: SocketAddr) -> Result<Self> {
-        Self::bind_with_heartbeat(
-            rest_addr,
-            grpc_addr,
-            DEFAULT_HEARTBEAT_INTERVAL_MS,
-            DEFAULT_LEASE_TIMEOUT_MS,
-        )
-        .await
+        Self::bind_with_lifecycle(rest_addr, grpc_addr, LifecycleSettings::default()).await
     }
 
     pub async fn bind_with_heartbeat(
@@ -45,10 +66,39 @@ impl Controller {
         heartbeat_interval_ms: u64,
         lease_timeout_ms: u64,
     ) -> Result<Self> {
-        let heartbeat = HeartbeatSettings::new(heartbeat_interval_ms, lease_timeout_ms)?;
+        Self::bind_with_lifecycle(
+            rest_addr,
+            grpc_addr,
+            LifecycleSettings {
+                heartbeat_interval_ms,
+                lease_timeout_ms,
+                ..LifecycleSettings::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn bind_with_lifecycle(
+        rest_addr: SocketAddr,
+        grpc_addr: SocketAddr,
+        settings: LifecycleSettings,
+    ) -> Result<Self> {
+        let heartbeat =
+            HeartbeatSettings::new(settings.heartbeat_interval_ms, settings.lease_timeout_ms)?;
         heartbeat
             .lease_expires_at(Utc::now())
             .map_err(registry_status)?;
+        ensure!(
+            settings.offline_retention_ms > 0,
+            "offline retention must be positive"
+        );
+        ensure!(
+            settings.sweep_interval_ms > 0,
+            "sweep interval must be positive"
+        );
+        let offline_retention =
+            TimeDelta::from_std(Duration::from_millis(settings.offline_retention_ms))
+                .context("offline retention is out of range")?;
         let rest = TcpListener::bind(rest_addr)
             .await
             .with_context(|| format!("bind REST listener at {rest_addr}"))?;
@@ -59,6 +109,8 @@ impl Controller {
             rest,
             grpc,
             heartbeat,
+            offline_retention,
+            sweep_interval: Duration::from_millis(settings.sweep_interval_ms),
         })
     }
 
@@ -71,23 +123,61 @@ impl Controller {
     }
 
     pub async fn serve(self) -> Result<()> {
+        self.serve_with_shutdown(future::pending()).await
+    }
+
+    pub async fn serve_with_shutdown(self, shutdown: impl Future<Output = ()>) -> Result<()> {
         let registry = Arc::new(Registry::new(self.heartbeat, Utc::now));
         let app = Router::new()
             .route("/health", get(health))
             .route(AGENTS_PATH, get(list_agents))
+            .route("/agents/{agent_id}", get(agent_detail))
             .with_state(registry.clone());
 
-        let rest = async { axum::serve(self.rest, app).await.context("serve REST API") };
+        let (shutdown_sender, shutdown_receiver) = watch::channel(());
+        let rest_shutdown = wait_for_shutdown(shutdown_receiver.clone());
+        let grpc_shutdown = wait_for_shutdown(shutdown_receiver.clone());
+        let sweep_shutdown = wait_for_shutdown(shutdown_receiver);
+
+        let sweep_registry = Arc::clone(&registry);
+        let sweep = async move {
+            let mut ticks = tokio::time::interval(self.sweep_interval);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tokio::pin!(sweep_shutdown);
+            loop {
+                tokio::select! {
+                    () = &mut sweep_shutdown => return Ok(()),
+                    _ = ticks.tick() => sweep_registry.sweep(self.offline_retention),
+                }
+            }
+        };
+
+        let rest = async {
+            axum::serve(self.rest, app)
+                .with_graceful_shutdown(rest_shutdown)
+                .await
+                .context("serve REST API")
+        };
         let grpc = async {
             Server::builder()
                 .add_service(AgentRegistrationServer::new(GrpcRegistry(registry)))
-                .serve_with_incoming(TcpListenerStream::new(self.grpc))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(self.grpc), grpc_shutdown)
                 .await
                 .context("serve gRPC API")
         };
-        tokio::try_join!(rest, grpc)?;
+        let stop = async move {
+            shutdown.await;
+            drop(shutdown_sender);
+            Ok(())
+        };
+        tokio::try_join!(rest, grpc, sweep, stop)?;
         Ok(())
     }
+}
+
+async fn wait_for_shutdown(mut listener: watch::Receiver<()>) {
+    // The sender is dropped once shutdown begins, waking current and future waiters.
+    let _ = listener.changed().await;
 }
 
 struct GrpcRegistry(Arc<Registry>);
@@ -162,8 +252,35 @@ async fn health() -> Json<Health> {
     Json(Health { status: "ok" })
 }
 
-async fn list_agents(State(registry): State<Arc<Registry>>) -> Json<Vec<AgentRecord>> {
-    Json(registry.snapshot())
+#[derive(Deserialize)]
+struct AgentListQuery {
+    status: Option<AgentStatus>,
+}
+
+async fn list_agents(
+    State(registry): State<Arc<Registry>>,
+    Query(query): Query<AgentListQuery>,
+) -> Json<Vec<AgentRecord>> {
+    Json(registry.snapshot(query.status))
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+async fn agent_detail(
+    State(registry): State<Arc<Registry>>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentDetail>, (StatusCode, Json<ErrorBody>)> {
+    registry.detail(&agent_id).map(Json).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody {
+                error: format!("Agent {agent_id:?} was not found"),
+            }),
+        )
+    })
 }
 
 #[cfg(test)]

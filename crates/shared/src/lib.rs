@@ -26,7 +26,12 @@ pub fn parse_controller_url(url: &str) -> Result<Uri> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentStatus {
+    #[serde(alias = "online")]
     Online,
+    #[serde(alias = "offline")]
+    Offline,
+    #[serde(alias = "disabled")]
+    Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +45,13 @@ pub struct AgentRecord {
     pub status: AgentStatus,
     pub registered_at: DateTime<Utc>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDetail {
+    #[serde(flatten)]
+    pub record: AgentRecord,
+    pub lease_expires_at: DateTime<Utc>,
 }
 
 pub mod grpc {

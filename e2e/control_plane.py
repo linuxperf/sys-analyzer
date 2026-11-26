@@ -16,6 +16,7 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 from uuid import UUID
 
 
@@ -48,6 +49,135 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(json.load(response), {"status": "ok"})
         self.assertEqual(self.cli(rest_addr, "list", "--output", "json").stdout, "[]\n")
+
+    def test_stalled_agent_goes_offline_is_evicted_and_can_recover(self):
+        rest_addr, grpc_addr = self.start_controller(
+            "--heartbeat-interval-ms", "40", "--lease-timeout-ms", "300",
+            "--offline-retention-ms", "1000", "--sweep-interval-ms", "20",
+        )
+        agent, log = self.start_agent(grpc_addr, "--agent-id", "stalled-agent")
+        agent_id, original_session = self.wait_for_registration(agent, log)
+
+        agent.send_signal(signal.SIGSTOP)
+        try:
+            self.wait_for_agent_status(rest_addr, agent_id, "Offline")
+            self.wait_for_agent_status(rest_addr, agent_id, None)
+        finally:
+            agent.send_signal(signal.SIGCONT)
+
+        self.wait_for_output(
+            agent, log,
+            rf'^Agent "stalled-agent" registered with session (?!{original_session}$)[0-9a-f-]+$',
+        )
+        recovered = self.wait_for_agent_status(rest_addr, agent_id, "Online")
+        self.assertEqual(recovered["pid"], agent.pid)
+
+    def test_controller_shuts_down_cleanly_on_sigint_and_sigterm(self):
+        for stop_signal in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(stop_signal=stop_signal.name):
+                controller, _ = self.spawn_controller()
+                controller.send_signal(stop_signal)
+                self.assertEqual(controller.wait(timeout=TIMEOUT), 0)
+
+    def test_cli_shows_agent_detail_and_reports_a_missing_agent(self):
+        rest_addr, grpc_addr = self.start_controller(
+            "--heartbeat-interval-ms", "100", "--lease-timeout-ms", "10000",
+        )
+        connection = http.client.HTTPConnection(rest_addr, timeout=TIMEOUT)
+        self.addCleanup(connection.close)
+        for agent_id in ("rack/节点?worker=%", ".", ".."):
+            with self.subTest(agent_id=agent_id):
+                agent, log = self.start_agent(
+                    grpc_addr, "--agent-id", agent_id, "--label", "detail", "--metadata", "zone=local",
+                )
+                self.wait_for_registration(agent, log)
+                detail = json.loads(self.cli(rest_addr, "show", agent_id, "--output", "json").stdout)
+                self.assertEqual(detail["agent_id"], agent_id)
+                self.assertEqual(detail["status"], "Online")
+                self.assertEqual(detail["hostname"], socket.gethostname())
+                self.assertEqual(detail["pid"], agent.pid)
+                self.assertEqual(detail["labels"], ["detail"])
+                self.assertEqual(detail["metadata"], {"zone": "local"})
+                self.assertEqual(detail["lease_expires_at"],
+                                 (detail["last_heartbeat_at"] or detail["registered_at"]) + 10)
+                table = self.cli(rest_addr, "show", agent_id).stdout
+                self.assertIn("Lease expires at (UTC)", table)
+                self.assertIn('{"zone":"local"}', table)
+
+                connection.request("GET", f"/agents/{quote(agent_id, safe='')}")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                rest_detail = json.load(response)
+                self.assertEqual(rest_detail["agent_id"], agent_id)
+                self.assertRegex(rest_detail["lease_expires_at"], UTC_TIMESTAMP)
+
+        connection.request("GET", "/agents/missing-agent")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 404)
+        self.assertIn("missing-agent", json.load(response)["error"])
+        missing = self.cli(rest_addr, "show", "missing-agent", check=False)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertEqual(missing.stdout, "")
+        self.assertIn("missing-agent", missing.stderr)
+        self.assertIn("404 Not Found", missing.stderr)
+
+    def test_cli_filters_states_and_offline_agent_can_register_again(self):
+        _, (rest_addr, grpc_addr) = self.spawn_controller(
+            env={
+                **os.environ,
+                "SYS_ANALYZER_HEARTBEAT_INTERVAL_MS": "50",
+                "SYS_ANALYZER_LEASE_TIMEOUT_MS": "500",
+                "SYS_ANALYZER_OFFLINE_RETENTION_MS": "30000",
+                "SYS_ANALYZER_SWEEP_INTERVAL_MS": "25",
+            },
+        )
+        healthy = self.start_agent(grpc_addr, "--agent-id", "healthy-agent")
+        self.wait_for_registration(*healthy)
+        first, log = self.start_agent(
+            grpc_addr, "--agent-id", "returning-agent", "--metadata", "zone=old",
+        )
+        agent_id, first_session = self.wait_for_registration(first, log)
+        first.kill()
+        first.wait(timeout=TIMEOUT)
+        offline = self.wait_for_agent_status(rest_addr, agent_id, "Offline")
+        self.assertEqual(offline["metadata"], {"zone": "old"})
+
+        for status, expected_ids in (
+            ("online", ["healthy-agent"]), ("Offline", [agent_id]), ("disabled", []),
+        ):
+            with self.subTest(status=status):
+                rows = json.loads(self.cli(
+                    rest_addr, "list", "--status", status, "--output", "json",
+                ).stdout)
+                self.assertEqual([row["agent_id"] for row in rows], expected_ids)
+
+        connection = http.client.HTTPConnection(rest_addr, timeout=TIMEOUT)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/agents?status=Offline")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        row, = json.load(response)
+        self.assertEqual(row["agent_id"], agent_id)
+
+        replacement, log = self.start_agent(
+            grpc_addr, "--agent-id", agent_id, "--label", "new", "--metadata", "zone=new",
+        )
+        _, replacement_session = self.wait_for_registration(replacement, log)
+        self.assertNotEqual(replacement_session, first_session)
+        online = self.wait_for_agent_status(rest_addr, agent_id, "Online")
+        self.assertEqual(online["pid"], replacement.pid)
+        self.assertEqual(online["labels"], ["new"])
+        self.assertEqual(online["metadata"], {"zone": "new"})
+
+    def wait_for_agent_status(self, rest_addr, agent_id, status):
+        deadline = time.monotonic() + TIMEOUT
+        while time.monotonic() < deadline:
+            rows = json.loads(self.cli(rest_addr, "list", "--output", "json").stdout)
+            row = next((row for row in rows if row["agent_id"] == agent_id), None)
+            if (row["status"] if row is not None else None) == status:
+                return row
+            time.sleep(0.025)
+        self.fail(f"Agent {agent_id!r} never reached status {status!r}")
 
     def test_registers_an_agent_and_exposes_its_metadata(self):
         rest_addr, grpc_addr = self.start_controller()
@@ -358,10 +488,10 @@ class ControlPlaneTests(unittest.TestCase):
         _, addresses = self.spawn_controller(*args)
         return addresses
 
-    def spawn_controller(self, *args, grpc_addr="127.0.0.1:0"):
+    def spawn_controller(self, *args, grpc_addr="127.0.0.1:0", env=None):
         process, log = self.spawn(
             "sys-analyzer-controller", "--rest-addr", "127.0.0.1:0", "--grpc-addr", grpc_addr,
-            *args,
+            *args, env=env,
         )
         addresses = self.wait_for_output(
             process, log, r"^Controller listening on REST (127\.0\.0\.1:\d+) and gRPC (127\.0\.0\.1:\d+)$",

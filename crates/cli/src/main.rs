@@ -7,12 +7,13 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use chrono::DateTime;
 use clap::{Parser, Subcommand, ValueEnum};
-use http::Uri;
+use http::{Uri, uri::PathAndQuery};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use serde::Serialize;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use serde::{Serialize, de::DeserializeOwned};
 use sys_analyzer_shared::{
-    AGENTS_PATH, AgentRecord, AgentStatus, DEFAULT_REST_ADDR, parse_controller_url,
+    AGENTS_PATH, AgentDetail, AgentRecord, AgentStatus, DEFAULT_REST_ADDR, parse_controller_url,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -29,9 +30,24 @@ struct Args {
 enum Command {
     /// List registered Agents
     List {
+        #[arg(long, value_enum, ignore_case = true)]
+        status: Option<StatusFilter>,
         #[arg(short, long, value_enum, default_value_t = Output::Table)]
         output: Output,
     },
+    /// Show a registered Agent and its lease
+    Show {
+        agent_id: String,
+        #[arg(short, long, value_enum, default_value_t = Output::Table)]
+        output: Output,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum StatusFilter {
+    Online,
+    Offline,
+    Disabled,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -53,6 +69,13 @@ struct AgentListRow<'a> {
     last_heartbeat_at: Option<i64>,
 }
 
+#[derive(Serialize)]
+struct AgentDetailRow<'a> {
+    #[serde(flatten)]
+    agent: AgentListRow<'a>,
+    lease_expires_at: i64,
+}
+
 impl<'a> From<&'a AgentRecord> for AgentListRow<'a> {
     fn from(agent: &'a AgentRecord) -> Self {
         Self {
@@ -72,20 +95,39 @@ impl<'a> From<&'a AgentRecord> for AgentListRow<'a> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let Command::List { output } = args.command;
-    let agents = list_agents(&args.controller)
-        .await
-        .with_context(|| format!("query Controller at {}", args.controller))?;
-
-    let mut writer = io::stdout().lock();
-    write_list(&mut writer, &agents, output)?;
-    writer.flush()?;
+    let stdout = io::stdout();
+    match args.command {
+        Command::List { status, output } => {
+            let path = match status {
+                Some(status) => {
+                    let value = status.to_possible_value().expect("valid status filter");
+                    PathAndQuery::try_from(format!("{AGENTS_PATH}?status={}", value.get_name()))?
+                }
+                None => PathAndQuery::from_static(AGENTS_PATH),
+            };
+            let agents: Vec<AgentRecord> = get_controller(&args.controller, path)
+                .await
+                .with_context(|| format!("query Controller at {}", args.controller))?;
+            write_list(&mut stdout.lock(), &agents, output)?;
+        }
+        Command::Show { agent_id, output } => {
+            let encoded_id = utf8_percent_encode(&agent_id, NON_ALPHANUMERIC);
+            let path = PathAndQuery::try_from(format!("{AGENTS_PATH}/{encoded_id}"))?;
+            let detail = get_controller(&args.controller, path)
+                .await
+                .with_context(|| {
+                    format!("query Agent {agent_id:?} at Controller {}", args.controller)
+                })?;
+            write_detail(&mut stdout.lock(), &detail, output)?;
+        }
+    }
+    stdout.lock().flush()?;
     Ok(())
 }
 
-async fn list_agents(controller: &str) -> Result<Vec<AgentRecord>> {
+async fn get_controller<T: DeserializeOwned>(controller: &str, path: PathAndQuery) -> Result<T> {
     let mut parts = parse_controller_url(controller)?.into_parts();
-    parts.path_and_query = Some(http::uri::PathAndQuery::from_static(AGENTS_PATH));
+    parts.path_and_query = Some(path);
     let uri = Uri::from_parts(parts)?;
     let client = Client::builder(TokioExecutor::new()).build_http::<Empty<bytes::Bytes>>();
     let body = tokio::time::timeout(Duration::from_secs(5), async {
@@ -104,19 +146,36 @@ async fn list_agents(controller: &str) -> Result<Vec<AgentRecord>> {
     .await
     .context("Controller request timed out")??
     .to_bytes();
-    serde_json::from_slice(&body).context("invalid Agent list from Controller")
+    serde_json::from_slice(&body).context("invalid Agent data from Controller")
 }
 
 fn write_list(writer: &mut impl Write, agents: &[AgentRecord], output: Output) -> Result<()> {
     let rows: Vec<_> = agents.iter().map(AgentListRow::from).collect();
     match output {
         Output::Table => write_table(writer, &rows),
-        Output::Json => {
-            serde_json::to_writer_pretty(&mut *writer, &rows)?;
-            writeln!(writer)?;
+        Output::Json => write_json(writer, &rows),
+    }
+}
+
+fn write_detail(writer: &mut impl Write, detail: &AgentDetail, output: Output) -> Result<()> {
+    let row = AgentDetailRow {
+        agent: AgentListRow::from(&detail.record),
+        lease_expires_at: detail.lease_expires_at.timestamp(),
+    };
+    match output {
+        Output::Table => {
+            write_table(writer, &[row.agent])?;
+            writeln!(writer, "Lease expires at (UTC)  {}", row.lease_expires_at)?;
             Ok(())
         }
+        Output::Json => write_json(writer, &row),
     }
+}
+
+fn write_json(writer: &mut impl Write, records: &impl Serialize) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *writer, records)?;
+    writeln!(writer)?;
+    Ok(())
 }
 
 fn write_table(writer: &mut impl Write, agents: &[AgentListRow<'_>]) -> Result<()> {
